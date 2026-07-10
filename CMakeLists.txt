@@ -13,6 +13,7 @@ option(LLBT_ENABLE_ALLOC_SET_ZERO "Zero-fill new allocations" OFF)
 option(LLBT_ENABLE_MEMDEBUG "Memory debug checks" OFF)
 option(LLBT_BUILD_TESTS "Build llbt tests" ON)
 option(LLBT_BUILD_EXAMPLES "Build llbt examples" OFF)
+option(LLBT_BUILD_BENCH "Build llbt benchmarks" OFF)
 option(LLBT_INSTALL "Generate install rules" ${PROJECT_IS_TOP_LEVEL})
 set(LLBT_MAX_BPNODE_SIZE 1000 CACHE STRING "Maximum B+tree node size")
 
@@ -135,6 +136,11 @@ endif()
 # ---- examples ----
 if(LLBT_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+# ---- benchmarks ----
+if(LLBT_BUILD_BENCH)
+    add_subdirectory(bench)
 endif()
 
 # ---- install / export ----
