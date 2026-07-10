@@ -1,0 +1,36 @@
+llbt — Low Level Binary Tree
+Copyright (c) 2026 the llbt authors
+
+This product includes code derived from Barq Core
+(https://github.com/BarqDB/barq-core). Files copied or derived from Barq Core
+retain their original copyright and license headers and have been modified as
+part of the llbt project; see the Git history for the specific changes.
+
+The NOTICE of Barq Core is reproduced below, as required by the Apache
+License, Version 2.0:
+
+----------------------------------------------------------------------
+
+Barq
+Copyright (c) 2026 the Barq authors
+
+This product is a modified fork of Realm Core
+(https://github.com/realm/realm-core).
+
+Realm Core is Copyright (c) Realm Inc. and its contributors and is licensed
+under the Apache License, Version 2.0. The original copyright and license
+headers are retained in the source files. Those files have been modified from
+their original form as part of the Barq project; see the Git history for the
+specific changes.
+
+Barq is an independent project. It is not affiliated with, sponsored by, or
+endorsed by Realm, MongoDB, Inc., or MongoDB Atlas. "Realm", "MongoDB", and
+"MongoDB Atlas" are trademarks of MongoDB, Inc., referenced here only for
+description and attribution.
+
+----------------------------------------------------------------------
+
+llbt is an independent project. It is not affiliated with, sponsored by, or
+endorsed by BarqDB, Realm, MongoDB, Inc., or MongoDB Atlas.
+
+Third-party component notices, if any, are provided in THIRD-PARTY-NOTICES.

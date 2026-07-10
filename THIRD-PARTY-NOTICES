@@ -1,0 +1,20 @@
+llbt third-party notices
+========================
+
+llbt's imported code originates from Barq Core (a fork of Realm Core); see
+NOTICE. This file lists third-party components that llbt vendors or links.
+
+1) IntelRDFPMathLib20U2 (src/external/IntelRDFPMathLib20U2/)
+   Copyright (c) 2018, Intel Corp. All rights reserved.
+   BSD 3-Clause style license — see src/external/IntelRDFPMathLib20U2/eula.txt.
+   Vendored subset (17 bid*.c translation units + headers) used for
+   Decimal128 arithmetic.
+
+2) nlohmann/json (src/external/json/)
+   MIT License — see src/external/json/LICENSE.MIT.
+   Single-header JSON library, used by the test harness's report writer.
+
+When built with LLBT_ENABLE_ENCRYPTION on non-Apple platforms, llbt links
+against OpenSSL (https://www.openssl.org), licensed under the Apache License
+2.0. OpenSSL is not vendored in this repository. On Apple platforms the
+system CommonCrypto framework is used instead.

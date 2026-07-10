@@ -1,0 +1,17 @@
+{
+  "name": "llbt",
+  "version": "3.0.0",
+  "description": "Low Level Binary Tree — battle-tested files, mmap, locking, crash-safe pages, and B+tree cursors for C++.",
+  "homepage": "https://github.com/mjm918/llbt",
+  "license": "Apache-2.0",
+  "dependencies": [
+    { "name": "vcpkg-cmake", "host": true },
+    { "name": "vcpkg-cmake-config", "host": true }
+  ],
+  "features": {
+    "encryption": {
+      "description": "AES page encryption",
+      "dependencies": [ { "name": "openssl", "platform": "!osx & !ios" } ]
+    }
+  }
+}

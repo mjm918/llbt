@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, name: macOS-arm64 }
+          - { os: macos-13, name: macOS-x64 }
+          - { os: ubuntu-24.04, name: Linux-x64 }
+          - { os: windows-2022, name: Windows-x64 }
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLBT_ENABLE_ASSERTIONS=ON -DLLBT_BUILD_EXAMPLES=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --parallel 4
+      - name: Run examples
+        if: runner.os != 'Windows'
+        run: |
+          for ex in build/examples/llbt-example-*; do echo "== $ex"; "$ex"; done
+
+  build-encryption:
+    runs-on: ubuntu-24.04
+    name: Linux-x64 (encryption ON)
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLBT_ENABLE_ENCRYPTION=ON -DLLBT_ENABLE_ASSERTIONS=ON
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure --parallel 4
