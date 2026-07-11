@@ -13,6 +13,9 @@
 #else
 #include <windows.h>
 #include <VersionHelpers.h>
+// GetFileVersionInfoSizeExW / GetFileVersionInfoExW / VerQueryValueW live in
+// the version API; link it (same #pragma pattern used for bcrypt/Pathcch).
+#pragma comment(lib, "Version.lib")
 #endif
 
 using namespace llbt;
