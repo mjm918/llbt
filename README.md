@@ -31,6 +31,12 @@ StoreRef store = Store::open("data.llbt");   // durable, on disk
     tx.commit();
 }
 
+// or hand the store a closure: concurrent write() calls coalesce into ONE
+// durable commit (group commit) — N threads pay ~one fsync instead of N
+store->write([](Tx& tx) {
+    tx.tree<int64_t>("scores").add(99);
+});
+
 // readers get frozen snapshots; they never block, writers never wait on them
 {
     Tx tx = store->begin_read();
@@ -118,6 +124,10 @@ in-memory store with no file behind it, and the whole thing driven from plain C.
 ## Semantics worth knowing
 
 - One write Tx at a time; readers are wait-free snapshots.
+- `Store::write()` batches concurrent writers into one physical commit
+  (group commit): same isolation and durability, one sync per batch. A
+  closure may re-run if a batch-mate throws, so keep side effects inside
+  the store; a lone writer costs the same as `begin_write()` + `commit()`.
 - An uncommitted write Tx rolls back when it goes out of scope (RAII).
 - Tree handles and refs are valid only within their Tx.
 - `set_root` / `erase_root` free the structure they replace — space returns

@@ -19,6 +19,8 @@
 //
 //   * one file, copy-on-write pages, crash-safe commits
 //   * single writer, many concurrent readers (MVCC snapshots)
+//   * group commit: concurrent Store::write() calls coalesce into one
+//     physical commit, so N threads pay ~one fsync instead of N
 //   * named roots ("buckets"): durable anchors for YOUR data structures
 //   * Tree<T>: a durable B+tree sequence with a Cursor
 //   * raw mode: build any structure out of Array nodes and anchor it
@@ -46,6 +48,7 @@
 #include <llbt/bplustree.hpp>
 #include <llbt/core/roots_replication.hpp>
 #include <llbt/exceptions.hpp>
+#include <llbt/util/function_ref.hpp>
 
 #include <memory>
 #include <optional>
@@ -131,6 +134,7 @@ using StoreRef = std::shared_ptr<Store>;
 class Tx {
 public:
     Tx(Tx&&) noexcept = default;
+    Tx& operator=(Tx&&) noexcept = default;
     ~Tx()
     {
         if (m_tr && m_writable && m_tr->get_transact_stage() == DB::transact_Writing)
@@ -187,14 +191,18 @@ public:
 
     // ---- lifecycle ----
     /// Commit and return the new version. The Tx is done afterwards.
+    /// Not available inside a Store::write() closure — there the store
+    /// commits the whole batch after the last closure returns.
     uint64_t commit()
     {
         require_write();
+        require_not_batched();
         return m_tr->commit();
     }
     void rollback()
     {
         require_write();
+        require_not_batched();
         m_tr->rollback();
     }
 
@@ -225,9 +233,18 @@ private:
             throw LogicError(ErrorCodes::WrongTransactionState, "read-only transaction");
     }
 
+    void require_not_batched() const
+    {
+        if (m_batched)
+            throw LogicError(ErrorCodes::WrongTransactionState,
+                             "no commit/rollback inside a Store::write() closure — "
+                             "the store commits the batch when every closure is done");
+    }
+
     TransactionRef m_tr;
     StoreRef m_store; // keeps the Store (and file) alive for the Tx lifetime
     bool m_writable;
+    bool m_batched = false; // Tx is shared by a Store::write() batch
     std::unique_ptr<detail::Registry> m_reg;
 };
 
@@ -328,6 +345,26 @@ public:
     /// Exclusive writer; blocks while another write Tx is open.
     Tx begin_write();
 
+    /// Run `fn` inside a write transaction and commit it — with group
+    /// commit: write() calls arriving while a commit is in flight are run
+    /// back-to-back in ONE shared transaction and made durable by ONE
+    /// commit (one fsync for the whole batch). A lone caller behaves
+    /// exactly like begin_write() + commit(). Returns the version the
+    /// changes landed in; batch-mates report the same version.
+    ///
+    /// Rules for `fn`:
+    ///  * It may run on another write()-calling thread, not necessarily
+    ///    the submitting one.
+    ///  * If a batch-mate throws, the shared transaction rolls back and
+    ///    every innocent closure re-runs alone — so `fn` can execute more
+    ///    than once, and must not have side effects outside the store.
+    ///  * A closure that throws fails only itself: its exception is
+    ///    rethrown from its own write() call, the rest still commit.
+    ///  * Don't commit/rollback the Tx you are given, and don't call
+    ///    write()/begin_write() on the same store from inside `fn` —
+    ///    both throw LogicError (the second would self-deadlock).
+    uint64_t write(util::FunctionRef<void(Tx&)> fn);
+
     /// Rewrite the file to its minimal size (needs no live transactions).
     /// A no-op returning false for an in-memory store (nothing to rewrite).
     bool compact();
@@ -341,8 +378,15 @@ public:
 
 private:
     Store() = default;
+
+    /// Group-commit state (queue, leadership); see store.cpp.
+    struct GroupCommitter;
+    /// Take the engine write lock, drain the queue, run the batch, commit.
+    void lead_batch(GroupCommitter& gc);
+
     std::unique_ptr<Replication> m_repl; // owns the replication in file mode
     DBRef m_db;                          // owns it in-memory (moved in at open)
+    std::unique_ptr<GroupCommitter> m_gc;
     bool m_in_memory = false;
 };
 

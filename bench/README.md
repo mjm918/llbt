@@ -112,6 +112,34 @@ The writer case updates a fixed 4,096-value tree in small commits. It does not
 grow an unbounded tree across samples. The `vs alone` column is the share of
 reader throughput retained while that writer runs.
 
+## Group commit
+
+`llbt-bench-group-commit` measures write throughput for T threads doing tiny
+durable transactions (set one slot of a 4,096-value tree), two ways: `plain`
+opens and commits its own transaction per write (one storage sync each);
+`grouped` goes through `Store::write()`, which coalesces concurrent writers
+into one physical commit per batch. `writes/commit` is the achieved batching
+factor, counted from the store's version delta.
+
+Representative run (Apple Silicon, APFS, 400 ms windows, median of 3):
+
+```
+overhead check (nosync, 1 thread): plain 317.5 k/s | grouped 312.0 k/s (98%)
+
+threads     plain wr/s   grouped wr/s   speedup  writes/commit
+--------------------------------------------------------------
+1              1.1 k/s        1.0 k/s     0.97x            1.0
+2              1.1 k/s        1.8 k/s     1.61x            1.5
+4              1.0 k/s        2.6 k/s     2.49x            2.5
+8              1.0 k/s        4.0 k/s     3.96x            5.1
+```
+
+The reading: plain writers stay flat as threads grow — they serialize on the
+write lock and each pays a full durable sync. Grouped writers scale with the
+batch size because the whole batch shares one sync. A lone writer loses
+nothing (0.97x durable, 98% nosync), so `write()` is safe to use as the
+default write path.
+
 ## Caveats
 
 - One machine and one filesystem are not a product-wide result.

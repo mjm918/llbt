@@ -53,6 +53,7 @@ struct llbt_store {
 
 struct llbt_txn {
     Tx tx;
+    bool borrowed = false; // handed to an llbt_write() callback; the batch owns it
     explicit llbt_txn(Tx&& t)
         : tx(std::move(t))
     {
@@ -389,6 +390,8 @@ extern "C" llbt_status llbt_txn_commit(llbt_txn* txn, uint64_t* out_version)
 {
     if (!txn)
         return fail(LLBT_E_INVALID_ARG, "null txn");
+    if (txn->borrowed)
+        return fail(LLBT_E_WRONG_TXN_STATE, "txn belongs to an llbt_write batch; return LLBT_OK to commit");
     std::unique_ptr<llbt_txn> owner(txn); // freed on every path; rolls back if commit throws
     try {
         uint64_t version = txn->tx.commit();
@@ -403,11 +406,46 @@ extern "C" llbt_status llbt_txn_commit(llbt_txn* txn, uint64_t* out_version)
 
 extern "C" void llbt_txn_abort(llbt_txn* txn)
 {
+    if (txn && txn->borrowed)
+        return; // borrowed from an llbt_write batch: not this caller's to free
     try {
         delete txn; // ~Tx rolls back a still-open write transaction
     }
     catch (...) {
         // never let an exception escape the C boundary
+    }
+}
+
+extern "C" llbt_status llbt_write(llbt_store* store, llbt_write_fn fn, void* user, uint64_t* out_version)
+{
+    if (!store || !fn)
+        return fail(LLBT_E_INVALID_ARG, "null store or callback");
+    // A non-OK callback status travels out of Store::write() as this
+    // exception so the engine rolls the entry back, then it turns back into
+    // the caller's status here.
+    struct CallbackFailed {
+        llbt_status status;
+    };
+    try {
+        uint64_t version = store->ref->write([&](Tx& tx) {
+            // The batch Tx is loaned to the callback through a stack handle;
+            // `borrowed` turns a stray commit/abort on it into a clean error.
+            llbt_txn handle(std::move(tx));
+            handle.borrowed = true;
+            llbt_status status = fn(&handle, user);
+            tx = std::move(handle.tx); // hand it back to the batch
+            if (status != LLBT_OK)
+                throw CallbackFailed{status};
+        });
+        if (out_version)
+            *out_version = version;
+        return ok();
+    }
+    catch (const CallbackFailed& e) {
+        return fail(e.status, "llbt_write callback returned an error");
+    }
+    catch (...) {
+        return current_exception_to_status();
     }
 }
 

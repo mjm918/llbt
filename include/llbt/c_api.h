@@ -193,6 +193,23 @@ llbt_status llbt_txn_commit(llbt_txn* txn, uint64_t* out_version);
  * Safe to pass NULL. */
 void llbt_txn_abort(llbt_txn* txn);
 
+/* Callback for llbt_write(): do your writes on `txn` and return LLBT_OK to
+ * commit. Any other status fails THIS entry alone — its changes roll back
+ * and the status comes back from its own llbt_write() call.
+ * Rules: the txn belongs to the batch, so llbt_txn_commit / llbt_txn_abort
+ * on it are rejected (do not free it). The callback may run on another
+ * llbt_write()-calling thread, and may run MORE THAN ONCE if a batch-mate
+ * fails (all effects roll back before the re-run) — keep side effects
+ * inside the store. */
+typedef llbt_status (*llbt_write_fn)(llbt_txn* txn, void* user);
+
+/* Run `fn` inside a write transaction and commit it, batching concurrent
+ * llbt_write() calls into ONE durable commit (group commit): N threads doing
+ * small writes pay ~one storage sync instead of N. A lone caller costs the
+ * same as begin_write + commit. On success `out_version` (nullable) receives
+ * the version the changes landed in; batch-mates see the same version. */
+llbt_status llbt_write(llbt_store* store, llbt_write_fn fn, void* user, uint64_t* out_version);
+
 /* Number of named roots visible in this transaction. */
 size_t llbt_txn_root_count(llbt_txn* txn);
 /* Copy the name of root #index into `buf` (NUL-terminated, truncated to

@@ -17,6 +17,11 @@
 #include <llbt/group.hpp>
 #include <llbt/db_options.hpp>
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <optional>
+
 using namespace llbt;
 using namespace llbt::core;
 using gf = llbt::_impl::GroupFriend;
@@ -131,10 +136,63 @@ void Registry::erase(size_t i)
 
 namespace llbt::core {
 
+namespace {
+// The store whose write() closure is running on this thread, if any. Lets a
+// nested write()/begin_write() on the same store fail loudly instead of
+// self-deadlocking on the engine write mutex (writes to a DIFFERENT store
+// from inside a closure stay legal).
+thread_local const Store* t_closure_store = nullptr;
+
+struct ClosureGuard {
+    const Store* prev;
+    explicit ClosureGuard(const Store* s) noexcept
+        : prev(t_closure_store)
+    {
+        t_closure_store = s;
+    }
+    ~ClosureGuard()
+    {
+        t_closure_store = prev;
+    }
+};
+} // anonymous namespace
+
+/// Group commit. Every write() call parks a Pending node on the queue; the
+/// first thread to find no active leader leads the next batch. The leader
+/// takes the engine write lock FIRST and drains the queue after — so every
+/// caller that piled up while the previous commit (or an unrelated
+/// begin_write()) was in flight lands in one shared transaction and is made
+/// durable by one commit. Waiters block on the condvar; results travel back
+/// through their own stack-allocated Pending.
+struct Store::GroupCommitter {
+    struct Pending {
+        util::FunctionRef<void(Tx&)> fn;
+        uint64_t version = 0;
+        std::exception_ptr error;
+        bool done = false;
+
+        explicit Pending(util::FunctionRef<void(Tx&)> f) noexcept
+            : fn(f)
+        {
+        }
+    };
+
+    /// Latency guard, not a throughput knob: a huge backlog is chopped into
+    /// commits of this size so early submitters aren't held hostage while
+    /// stragglers keep arriving.
+    static constexpr size_t max_batch = 64;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Pending*> queue;
+    bool leader_active = false;
+};
+
 StoreRef Store::open(const std::string& path, const Options& options)
 {
     auto store = StoreRef(new Store());
     store->m_repl = core_detail::make_roots_replication();
+    store->m_gc = std::make_unique<GroupCommitter>();
 
     DBOptions db_options;
     db_options.encryption_key = options.encryption_key;
@@ -149,6 +207,7 @@ StoreRef Store::open_in_memory(const Options&)
 {
     auto store = StoreRef(new Store());
     store->m_in_memory = true;
+    store->m_gc = std::make_unique<GroupCommitter>();
 
     // No file: the roots replication is owned by the DB (moved in), and the
     // allocator runs on an anonymous in-memory buffer. Durability::MemOnly is
@@ -169,7 +228,152 @@ Tx Store::begin_read()
 
 Tx Store::begin_write()
 {
+    if (t_closure_store == this)
+        throw LogicError(ErrorCodes::WrongTransactionState,
+                         "begin_write() inside a Store::write() closure would deadlock — "
+                         "use the Tx the closure was given");
     return Tx(m_db->start_write(), shared_from_this(), true);
+}
+
+uint64_t Store::write(util::FunctionRef<void(Tx&)> fn)
+{
+    if (t_closure_store == this)
+        throw LogicError(ErrorCodes::WrongTransactionState,
+                         "write() inside a Store::write() closure would deadlock — "
+                         "use the Tx the closure was given");
+
+    GroupCommitter& gc = *m_gc;
+    GroupCommitter::Pending me(fn);
+
+    std::unique_lock<std::mutex> lock(gc.mutex);
+    gc.queue.push_back(&me);
+    while (!me.done) {
+        if (gc.leader_active) {
+            gc.cv.wait(lock, [&] {
+                return me.done || !gc.leader_active;
+            });
+            continue;
+        }
+        // No commit in flight: this thread leads the next batch (which is
+        // guaranteed to contain at least its own entry, in queue order).
+        gc.leader_active = true;
+        lock.unlock();
+        lead_batch(gc);
+        lock.lock();
+        gc.leader_active = false;
+        gc.cv.notify_all();
+    }
+    lock.unlock();
+
+    if (me.error)
+        std::rethrow_exception(me.error);
+    return me.version;
+}
+
+void Store::lead_batch(GroupCommitter& gc)
+{
+    using Pending = GroupCommitter::Pending;
+    Pending* batch[GroupCommitter::max_batch];
+    size_t n = 0;
+
+    auto drain = [&]() noexcept {
+        std::lock_guard<std::mutex> lg(gc.mutex);
+        while (n < GroupCommitter::max_batch && !gc.queue.empty()) {
+            batch[n++] = gc.queue.front();
+            gc.queue.pop_front();
+        }
+    };
+    auto finish = [&](auto&& set_result) {
+        std::lock_guard<std::mutex> lg(gc.mutex);
+        for (size_t i = 0; i < n; ++i) {
+            set_result(*batch[i]);
+            batch[i]->done = true;
+        }
+    };
+
+    // The engine write lock first, the queue second: everything that queued
+    // up while we waited for the lock rides along in this batch.
+    std::optional<Tx> tx;
+    try {
+        tx.emplace(begin_write());
+    }
+    catch (...) {
+        // Nobody can run. Fail everything queued so far with the same cause;
+        // later arrivals elect a fresh leader and try again.
+        drain();
+        auto err = std::current_exception();
+        finish([&](Pending& p) {
+            p.error = err;
+        });
+        return;
+    }
+    drain();
+    tx->m_batched = true; // closures must not commit/rollback the shared Tx
+
+    // Run the whole batch in the shared transaction, then commit once.
+    std::exception_ptr batch_error;
+    size_t thrower = n; // index of a throwing closure; n = none
+    {
+        ClosureGuard guard(this);
+        for (size_t i = 0; i < n; ++i) {
+            try {
+                batch[i]->fn(*tx);
+            }
+            catch (...) {
+                batch_error = std::current_exception();
+                thrower = i;
+                break;
+            }
+        }
+    }
+    if (thrower == n) {
+        try {
+            tx->m_batched = false;
+            uint64_t version = tx->commit();
+            finish([&](Pending& p) {
+                p.version = version;
+            });
+            return;
+        }
+        catch (...) {
+            batch_error = std::current_exception();
+        }
+    }
+
+    // A closure threw, or the commit itself failed: every effect of the
+    // batch is rolled back (Tx dtor), and each entry gets an individual
+    // outcome. A throwing closure is NOT re-run — its fate is decided.
+    tx.reset();
+
+    if (n == 1) {
+        finish([&](Pending& p) {
+            p.error = batch_error;
+        });
+        return;
+    }
+
+    auto run_one = [&](Pending& p) noexcept {
+        try {
+            Tx own = Tx(m_db->start_write(), shared_from_this(), true);
+            own.m_batched = true;
+            {
+                ClosureGuard guard(this);
+                p.fn(own);
+            }
+            own.m_batched = false;
+            p.version = own.commit();
+        }
+        catch (...) {
+            p.error = std::current_exception();
+        }
+    };
+    for (size_t i = 0; i < n; ++i) {
+        if (i == thrower)
+            batch[i]->error = batch_error;
+        else
+            run_one(*batch[i]);
+    }
+    finish([](Pending&) {});
 }
 
 bool Store::compact()

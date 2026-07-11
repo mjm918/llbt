@@ -275,4 +275,88 @@ TEST(CApi_FilePersistence)
     }
 }
 
+namespace {
+// llbt_write callbacks (plain C shape: no captures, context through `user`)
+struct GroupedWriteCtx {
+    int64_t value = 0;
+    llbt_status inner_commit_status = LLBT_OK;
+    int runs = 0;
+};
+
+llbt_status grouped_add_cb(llbt_txn* txn, void* user)
+{
+    auto* ctx = static_cast<GroupedWriteCtx*>(user);
+    ++ctx->runs;
+    llbt_tree* t = nullptr;
+    llbt_status st = llbt_tree_open(txn, "gnums", LLBT_TYPE_INT64, &t);
+    if (st != LLBT_OK)
+        return st;
+    llbt_value v = llbt_int64(ctx->value);
+    st = llbt_tree_add(t, &v);
+    llbt_tree_destroy(t);
+    return st;
+}
+
+llbt_status grouped_misuse_cb(llbt_txn* txn, void* user)
+{
+    auto* ctx = static_cast<GroupedWriteCtx*>(user);
+    // the txn is the batch's: a stray commit/abort must bounce off harmlessly
+    ctx->inner_commit_status = llbt_txn_commit(txn, nullptr);
+    llbt_txn_abort(txn); // must be a no-op, not a free
+    return grouped_add_cb(txn, user);
+}
+
+llbt_status grouped_fail_cb(llbt_txn* txn, void* user)
+{
+    grouped_add_cb(txn, user);
+    return LLBT_E_ILLEGAL_OP; // fail this entry: its add must roll back
+}
+} // namespace
+
+TEST(CApi_GroupedWrite)
+{
+    llbt_store* store = nullptr;
+    CHECK_EQUAL(llbt_store_open_in_memory(&store), LLBT_OK);
+
+    // two grouped writes commit and report growing versions
+    GroupedWriteCtx a;
+    a.value = 7;
+    uint64_t v1 = 0;
+    CHECK_EQUAL(llbt_write(store, grouped_add_cb, &a, &v1), LLBT_OK);
+    CHECK_EQUAL(a.runs, 1);
+    CHECK(v1 > 0);
+
+    GroupedWriteCtx b;
+    b.value = 9;
+    uint64_t v2 = 0;
+    CHECK_EQUAL(llbt_write(store, grouped_misuse_cb, &b, &v2), LLBT_OK);
+    CHECK_EQUAL(v2, v1 + 1);
+    // the in-callback commit was rejected cleanly, the write still landed
+    CHECK_EQUAL(b.inner_commit_status, LLBT_E_WRONG_TXN_STATE);
+
+    // a failing callback returns its status and leaves no trace
+    GroupedWriteCtx c;
+    c.value = 11;
+    CHECK_EQUAL(llbt_write(store, grouped_fail_cb, &c, nullptr), LLBT_E_ILLEGAL_OP);
+
+    llbt_txn* r = nullptr;
+    CHECK_EQUAL(llbt_txn_begin_read(store, &r), LLBT_OK);
+    llbt_tree* t = nullptr;
+    CHECK_EQUAL(llbt_tree_open(r, "gnums", LLBT_TYPE_INT64, &t), LLBT_OK);
+    CHECK_EQUAL(llbt_tree_size(t), size_t(2)); // 7 and 9; the failed 11 rolled back
+    llbt_value out;
+    CHECK_EQUAL(llbt_tree_get(t, 0, &out), LLBT_OK);
+    CHECK_EQUAL(out.as.i64, int64_t(7));
+    CHECK_EQUAL(llbt_tree_get(t, 1, &out), LLBT_OK);
+    CHECK_EQUAL(out.as.i64, int64_t(9));
+    llbt_tree_destroy(t);
+    llbt_txn_abort(r);
+
+    // null-argument hygiene
+    CHECK_EQUAL(llbt_write(nullptr, grouped_add_cb, &a, nullptr), LLBT_E_INVALID_ARG);
+    CHECK_EQUAL(llbt_write(store, nullptr, &a, nullptr), LLBT_E_INVALID_ARG);
+
+    llbt_store_close(store);
+}
+
 #endif // TEST_C_API

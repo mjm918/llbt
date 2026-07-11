@@ -21,6 +21,13 @@
 
 #include "test.hpp"
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <set>
+#include <thread>
+#include <vector>
+
 using namespace llbt;
 using namespace llbt::core;
 using namespace llbt::test_util;
@@ -530,5 +537,282 @@ TEST_IF(CoreStore_EncryptedFailedCommitDropsWindowCache, _impl::SimulatedFailure
         CHECK_EQUAL(values.get(i), 222222);
 }
 #endif
+
+// ---- group commit ----------------------------------------------------------
+
+TEST(CoreStore_GroupCommitSingleThread)
+{
+    TEST_PATH(path);
+    {
+        StoreRef store = Store::open(path);
+        uint64_t v1 = store->write([](Tx& tx) {
+            tx.tree<int64_t>("n").add(7);
+        });
+        uint64_t v2 = store->write([](Tx& tx) {
+            Tree<int64_t> t = tx.tree<int64_t>("n");
+            t.add(t.get(0) * 2);
+        });
+        CHECK_EQUAL(v2, v1 + 1);
+
+        Tx tx = store->begin_read();
+        Tree<int64_t> t = tx.tree<int64_t>("n");
+        CHECK_EQUAL(t.size(), 2);
+        CHECK_EQUAL(t.get(0), 7);
+        CHECK_EQUAL(t.get(1), 14);
+    }
+    // grouped writes are as durable as plain ones: fresh session sees them
+    StoreRef store = Store::open(path);
+    Tx tx = store->begin_read();
+    CHECK_EQUAL(tx.tree<int64_t>("n").size(), 2);
+}
+
+TEST(CoreStore_GroupCommitManyThreads)
+{
+    TEST_PATH(path);
+    Options options;
+    options.no_sync = true; // batching logic is identical; keeps CI fast
+    StoreRef store = Store::open(path, options);
+
+    constexpr int num_threads = 8;
+    constexpr int writes_per_thread = 50;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            for (int i = 0; i < writes_per_thread; ++i) {
+                int64_t value = int64_t(t) * 1000 + i;
+                try {
+                    store->write([&](Tx& tx) {
+                        Tree<int64_t> tree = tx.tree<int64_t>("values");
+                        tree.insert(tree.lower_bound(value), value);
+                    });
+                }
+                catch (...) {
+                    failures.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& w : workers)
+        w.join();
+    CHECK_EQUAL(failures.load(), 0);
+
+    // every submitted value landed exactly once (distinct values + exact size)
+    Tx tx = store->begin_read();
+    Tree<int64_t> tree = tx.tree<int64_t>("values");
+    CHECK_EQUAL(tree.size(), num_threads * writes_per_thread);
+    for (int t = 0; t < num_threads; ++t)
+        for (int i = 0; i < writes_per_thread; ++i)
+            CHECK_NOT_EQUAL(tree.find_first(int64_t(t) * 1000 + i), Tx::npos);
+}
+
+TEST(CoreStore_GroupCommitBatchesUnderContention)
+{
+    TEST_PATH(path);
+    StoreRef store = Store::open(path);
+
+    constexpr int num_threads = 8;
+    std::vector<std::thread> workers;
+    std::vector<uint64_t> versions(num_threads, 0);
+    std::atomic<int> started{0};
+
+    Tx blocker = store->begin_write(); // holds the engine write lock
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            started.fetch_add(1);
+            versions[size_t(t)] = store->write([t](Tx& tx) {
+                tx.tree<int64_t>("batched").add(t);
+            });
+        });
+    }
+    while (started.load() < num_threads)
+        std::this_thread::yield();
+    // let every worker park in the group-commit queue behind the blocker
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    uint64_t blocked_version = blocker.commit();
+    for (auto& w : workers)
+        w.join();
+
+    // Everything queued while the lock was held rides in the batch that forms
+    // when the lock frees up: 8 writes in one commit (two, if a worker thread
+    // was still warming up when the batch drained).
+    std::set<uint64_t> distinct(versions.begin(), versions.end());
+    CHECK_LESS_EQUAL(distinct.size(), 2);
+    for (int t = 0; t < num_threads; ++t)
+        CHECK_GREATER(versions[size_t(t)], blocked_version);
+
+    Tx tx = store->begin_read();
+    Tree<int64_t> tree = tx.tree<int64_t>("batched");
+    CHECK_EQUAL(tree.size(), num_threads);
+    for (int t = 0; t < num_threads; ++t)
+        CHECK_NOT_EQUAL(tree.find_first(t), Tx::npos);
+}
+
+TEST(CoreStore_GroupCommitExceptionIsolation)
+{
+    TEST_PATH(path);
+    StoreRef store = Store::open(path);
+
+    struct Boom : std::exception {
+    };
+
+    constexpr int num_threads = 4;
+    std::vector<std::thread> workers;
+    std::array<std::exception_ptr, num_threads> errors;
+    std::atomic<int> started{0};
+
+    Tx blocker = store->begin_write(); // force the four writes into one batch
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            started.fetch_add(1);
+            try {
+                store->write([t](Tx& tx) {
+                    tx.tree<int64_t>("iso").add(100 * (t + 1));
+                    if (t == 1)
+                        throw Boom();
+                });
+            }
+            catch (...) {
+                errors[size_t(t)] = std::current_exception();
+            }
+        });
+    }
+    while (started.load() < num_threads)
+        std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    blocker.commit();
+    for (auto& w : workers)
+        w.join();
+
+    // the thrower fails with its own exception; everyone else commits
+    CHECK(!errors[0]);
+    CHECK(bool(errors[1]));
+    CHECK(!errors[2]);
+    CHECK(!errors[3]);
+    bool got_boom = false;
+    if (errors[1]) {
+        try {
+            std::rethrow_exception(errors[1]);
+        }
+        catch (const Boom&) {
+            got_boom = true;
+        }
+        catch (...) {
+        }
+    }
+    CHECK(got_boom);
+
+    // survivors may have run twice (batch attempt + solo re-run after the
+    // poisoned batch rolled back) but their effect lands exactly once, and
+    // nothing of the thrower's work survives
+    Tx tx = store->begin_read();
+    Tree<int64_t> tree = tx.tree<int64_t>("iso");
+    CHECK_EQUAL(tree.size(), 3);
+    CHECK_NOT_EQUAL(tree.find_first(100), Tx::npos);
+    CHECK_EQUAL(tree.find_first(200), Tx::npos);
+    CHECK_NOT_EQUAL(tree.find_first(300), Tx::npos);
+    CHECK_NOT_EQUAL(tree.find_first(400), Tx::npos);
+}
+
+TEST(CoreStore_GroupCommitClosureRules)
+{
+    TEST_PATH(path);
+    StoreRef store = Store::open(path);
+    StoreRef other = Store::open_in_memory();
+
+    uint64_t version = store->write([&](Tx& tx) {
+        tx.tree<int64_t>("rules").add(1);
+        // the Tx belongs to the whole batch: no commit/rollback from a closure
+        CHECK_THROW(tx.commit(), LogicError);
+        CHECK_THROW(tx.rollback(), LogicError);
+        // nested writes on the same store would self-deadlock: refused
+        CHECK_THROW(store->write([](Tx&) {}), LogicError);
+        CHECK_THROW(store->begin_write(), LogicError);
+        // writing to a DIFFERENT store from inside a closure stays legal
+        other->write([](Tx& o) {
+            o.tree<int64_t>("side").add(9);
+        });
+    });
+    CHECK_GREATER(version, 0);
+
+    // the guard throws survived inside the closure without poisoning it
+    CHECK_EQUAL(store->begin_read().tree<int64_t>("rules").size(), 1);
+    CHECK_EQUAL(other->begin_read().tree<int64_t>("side").size(), 1);
+}
+
+TEST(CoreStore_GroupCommitInMemory)
+{
+    StoreRef store = Store::open_in_memory();
+
+    constexpr int num_threads = 4;
+    constexpr int writes_per_thread = 25;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            for (int i = 0; i < writes_per_thread; ++i) {
+                try {
+                    store->write([&](Tx& tx) {
+                        tx.tree<int64_t>("mem").add(int64_t(t) * 1000 + i);
+                    });
+                }
+                catch (...) {
+                    failures.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& w : workers)
+        w.join();
+    CHECK_EQUAL(failures.load(), 0);
+    CHECK_EQUAL(store->begin_read().tree<int64_t>("mem").size(), num_threads * writes_per_thread);
+}
+
+TEST(CoreStore_GroupCommitInteropWithPlainWriters)
+{
+    TEST_PATH(path);
+    Options options;
+    options.no_sync = true;
+    StoreRef store = Store::open(path, options);
+
+    constexpr int writes_per_thread = 100;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 2; ++t) {
+        // plain writers take the engine lock directly...
+        workers.emplace_back([&, t] {
+            try {
+                for (int i = 0; i < writes_per_thread; ++i) {
+                    Tx tx = store->begin_write();
+                    tx.tree<int64_t>("plain").add(int64_t(t) * 1000 + i);
+                    tx.commit();
+                }
+            }
+            catch (...) {
+                failures.fetch_add(1);
+            }
+        });
+        // ...while grouped writers batch behind whoever holds it
+        workers.emplace_back([&, t] {
+            try {
+                for (int i = 0; i < writes_per_thread; ++i) {
+                    store->write([&](Tx& tx) {
+                        tx.tree<int64_t>("grouped").add(int64_t(t) * 1000 + i);
+                    });
+                }
+            }
+            catch (...) {
+                failures.fetch_add(1);
+            }
+        });
+    }
+    for (auto& w : workers)
+        w.join();
+    CHECK_EQUAL(failures.load(), 0);
+
+    Tx tx = store->begin_read();
+    CHECK_EQUAL(tx.tree<int64_t>("plain").size(), 2 * writes_per_thread);
+    CHECK_EQUAL(tx.tree<int64_t>("grouped").size(), 2 * writes_per_thread);
+}
 
 #endif // TEST_CORE_STORE
