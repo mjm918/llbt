@@ -21,8 +21,10 @@ LIBRARY/src/bid_round.c
 add_library(Bid OBJECT ${BID_SOURCES})
 if(MSVC)
     get_target_property(comp_opts Bid COMPILE_OPTIONS)
-    string(REGEX REPLACE "/W[1234]" "/W1" comp_opts "${comp_opts}")
-    set_target_properties(Bid PROPERTIES COMPILE_OPTIONS "${comp_opts}")
+    if(comp_opts)
+        string(REGEX REPLACE "/W[1234]" "/W1" comp_opts "${comp_opts}")
+        set_target_properties(Bid PROPERTIES COMPILE_OPTIONS "${comp_opts}")
+    endif()
     target_compile_options(Bid PUBLIC /sdl-)
 endif()
 

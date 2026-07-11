@@ -17,6 +17,9 @@
  **************************************************************************/
 
 #include <llbt/mixed.hpp>
+
+#include <climits>
+
 #include <llbt/decimal128.hpp>
 #include <llbt/unicode.hpp>
 #include <llbt/column_type_traits.hpp>
