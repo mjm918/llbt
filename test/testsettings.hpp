@@ -37,6 +37,7 @@
 #define TEST_BASIC_UTILS
 #define TEST_BPLUS_TREE
 #define TEST_CORE_STORE // llbt::core public layer (added by llbt)
+#define TEST_C_API      // extern "C" surface (added by llbt)
 #define TEST_COLUMN_MIXED
 #define TEST_ALLOC
 #define TEST_ARRAY

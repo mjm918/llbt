@@ -61,6 +61,34 @@ tx.commit();
 | Roots | `tx.tree<T>()`, `tx.set_root()` | durable named anchors — the bucket directory |
 | Trees | `core::Tree<T>`, `core::Cursor<T>` | B+tree sequences of int64/float/double/string/binary/timestamp |
 | Raw | `tx.alloc()`, `Array`, `BPlusTree<T>` | page-level building blocks for your own structures |
+| C API | `<llbt/c_api.h>` | a pure-C `extern "C"` surface over Store/Tx/Tree/Cursor — for FFI and other languages |
+
+## From C
+
+The store, transactions, typed trees and cursors are all reachable from plain
+C through `<llbt/c_api.h>`: opaque handles, a small tagged-union value type,
+and status codes instead of exceptions.
+
+```c
+#include <llbt/c_api.h>
+
+llbt_store* store;
+llbt_store_open_in_memory(&store);
+
+llbt_txn* tx;
+llbt_txn_begin_write(store, &tx);
+llbt_tree* scores;
+llbt_tree_open(tx, "scores", LLBT_TYPE_INT64, &scores);
+llbt_value v = llbt_int64(42);
+llbt_tree_add(scores, &v);
+llbt_tree_destroy(scores);
+llbt_txn_commit(tx, NULL);          /* frees tx */
+
+llbt_store_close(store);
+```
+
+Every fallible call returns `llbt_status` (0 == `LLBT_OK`); `llbt_last_error()`
+carries the message. Full walk-through in [examples/07_c_api.c](examples/07_c_api.c).
 
 ## Build
 
@@ -84,8 +112,8 @@ target_link_libraries(your_target PRIVATE llbt::core)
 
 Runnable examples in [examples/](examples/): files+mmap, an ordered KV store
 with cursors, MVCC concurrent readers, a hand-built structure from raw page
-nodes, iterating/querying data (point lookups, range scans, filters), and an
-in-memory store with no file behind it.
+nodes, iterating/querying data (point lookups, range scans, filters), an
+in-memory store with no file behind it, and the whole thing driven from plain C.
 
 ## Semantics worth knowing
 
