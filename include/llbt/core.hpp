@@ -58,9 +58,16 @@ using NodeRef = llbt::ref_type; // a page-tree reference inside the file
 struct Options {
     /// 64-byte AES key, or null. Requires LLBT_ENABLE_ENCRYPTION.
     const char* encryption_key = nullptr;
-    /// If true, commits skip fsync. Fast; last commits may
-    /// be lost on power failure, the file stays consistent.
+    /// If true, commits skip storage synchronization. Fast, and normally safe
+    /// across a process crash, but an OS crash or power loss can lose recent
+    /// commits or leave the file unusable. Use only for rebuildable data.
     bool no_sync = false;
+    /// Promise that this file is only ever opened from one process at a
+    /// time (threads are fine). Commits then skip the per-operation file
+    /// locks that cross-process safety costs on Apple/Android — noticeably
+    /// faster. Opening the same file from two processes with this set is
+    /// undefined behavior. In-memory stores always run in this mode.
+    bool single_process = false;
 };
 
 namespace detail {
@@ -243,6 +250,11 @@ public:
 
     /// Index of the first element equal to `value`, or Tx::npos.
     size_t find_first(T value) const noexcept { return m_bt->find_first(value); }
+
+    /// Index of the first element >= `value` (like std::lower_bound). Only
+    /// meaningful while you keep the tree sorted — the usual pattern is
+    /// `insert(lower_bound(v), v)`.
+    size_t lower_bound(T value) const { return m_bt->lower_bound(value); }
 
     Cursor<T> cursor() const;
 

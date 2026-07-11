@@ -165,6 +165,70 @@ size_t ArrayUnsigned::upper_bound(uint64_t value) const noexcept
     return pos - arr;
 }
 
+void ArrayUnsigned::adjust(size_t begin, size_t end, int64_t diff)
+{
+    if (diff == 0 || begin >= end)
+        return;
+    LLBT_ASSERT_DEBUG(begin <= m_size);
+    LLBT_ASSERT_DEBUG(end <= m_size);
+    if (m_width < 8) {
+        // legacy sub-byte widths: set() widens as needed
+        for (size_t i = begin; i != end; ++i)
+            set(i, get(i) + diff); // Throws
+        return;
+    }
+    if (diff > 0) {
+        uint64_t mx = 0;
+        for (size_t i = begin; i != end; ++i) {
+            uint64_t v = _get(i, m_width);
+            if (v > mx)
+                mx = v;
+        }
+        if (mx + uint64_t(diff) > m_ubound) {
+            // rare: the adjusted values need a wider representation;
+            // set() widens as it goes
+            for (size_t i = begin; i != end; ++i)
+                set(i, get(i) + diff); // Throws
+            return;
+        }
+    }
+    else {
+        // Preserve the old unsigned-wrap behavior on underflow. The wrapped
+        // value is near UINT64_MAX and therefore needs a 64-bit widening; a
+        // direct narrow write here would silently truncate it (0 - 1 became
+        // 255 in an 8-bit array instead of UINT64_MAX).
+        const uint64_t magnitude = uint64_t(-(diff + 1)) + 1;
+        for (size_t i = begin; i != end; ++i) {
+            if (_get(i, m_width) < magnitude) {
+                for (size_t j = begin; j != end; ++j)
+                    set(j, get(j) + diff); // Throws
+                return;
+            }
+        }
+    }
+    copy_on_write(); // Throws
+    if (m_width == 8) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(m_data);
+        for (size_t i = begin; i != end; ++i)
+            p[i] = uint8_t(p[i] + uint64_t(diff));
+    }
+    else if (m_width == 16) {
+        uint16_t* p = reinterpret_cast<uint16_t*>(m_data);
+        for (size_t i = begin; i != end; ++i)
+            p[i] = uint16_t(p[i] + uint64_t(diff));
+    }
+    else if (m_width == 32) {
+        uint32_t* p = reinterpret_cast<uint32_t*>(m_data);
+        for (size_t i = begin; i != end; ++i)
+            p[i] = uint32_t(p[i] + uint64_t(diff));
+    }
+    else {
+        uint64_t* p = reinterpret_cast<uint64_t*>(m_data);
+        for (size_t i = begin; i != end; ++i)
+            p[i] += uint64_t(diff);
+    }
+}
+
 void ArrayUnsigned::insert(size_t ndx, uint64_t value)
 {
     LLBT_ASSERT_DEBUG(m_width >= 8);

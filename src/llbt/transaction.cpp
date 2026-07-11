@@ -91,10 +91,11 @@ DB::version_type Transaction::commit()
     DB::version_type new_version = db->do_commit(*this); // Throws
 
     // We need to set m_read_lock in order for wait_for_change to work.
-    // To set it, we grab a readlock on the latest available snapshot
-    // and release it again.
-    DB::ReadLockInfo lock_after_commit = db->grab_read_lock(DB::ReadLockInfo::Live, VersionID());
-    db->release_read_lock(lock_after_commit);
+    // low_level_commit recorded the committed snapshot while the write lock
+    // still made it the newest version, so no grab/release round trip
+    // through the version list is needed (a grabbed lock would be released
+    // right away anyway — m_read_lock only carries the version numbers).
+    DB::ReadLockInfo lock_after_commit = m_post_commit_read_lock;
 
     db->end_write_on_correct_thread();
 
@@ -316,7 +317,10 @@ void Transaction::complete_async_commit()
             db->m_logger->log(util::LogCategory::transaction, util::Logger::Level::trace,
                               "Tr %1: Committing ref %2 to disk", m_log_id, read_lock.m_top_ref);
         }
-        GroupCommitter out(*this);
+        // Async commits first publish an in-memory version with Unsafe
+        // durability, then this path makes it durable. Reuse the DB's window
+        // cache so encrypted/data pages are flushed before the header.
+        GroupCommitter out(*this, DBOptions::Durability::Full, nullptr, db->m_write_window_mgr.get());
         out.commit(read_lock.m_top_ref); // Throws
         // we must release the write mutex before the callback, because the callback
         // is allowed to re-request it.
@@ -327,6 +331,10 @@ void Transaction::complete_async_commit()
         }
     }
     catch (const std::exception& e) {
+        if (db->m_write_window_mgr) {
+            db->m_write_window_mgr->clear_failed_mappings();
+            db->m_write_window_mgr.reset();
+        }
         m_commit_exception = std::current_exception();
         if (db->m_logger) {
             db->m_logger->log(util::LogCategory::transaction, util::Logger::Level::error,

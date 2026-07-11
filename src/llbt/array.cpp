@@ -401,6 +401,65 @@ void Array::add_positive_local(int64_t value)
 }
 */
 
+void Array::adjust(size_t begin, size_t end, int_fast64_t diff)
+{
+    if (diff == 0 || begin >= end)
+        return;
+    LLBT_ASSERT_3(begin, <=, m_size);
+    LLBT_ASSERT_3(end, <=, m_size);
+    // One pass to learn whether every adjusted value still fits the current
+    // width; the common case then runs without per-element COW/width checks.
+    int64_t mn = std::numeric_limits<int64_t>::max();
+    int64_t mx = std::numeric_limits<int64_t>::min();
+    for (size_t i = begin; i != end; ++i) {
+        int64_t v = (this->*m_getter)(i);
+        if (v < mn)
+            mn = v;
+        if (v > mx)
+            mx = v;
+    }
+    if (mn + diff < m_lbound || mx + diff > m_ubound) {
+        // rare: some adjusted value needs a wider representation;
+        // set() widens as it goes
+        for (size_t i = begin; i != end; ++i)
+            set(i, (this->*m_getter)(i) + diff); // Throws
+        return;
+    }
+    copy_on_write(); // Throws
+    switch (m_width) {
+        case 8: {
+            int8_t* p = reinterpret_cast<int8_t*>(m_data);
+            for (size_t i = begin; i != end; ++i)
+                p[i] = int8_t(p[i] + diff);
+            break;
+        }
+        case 16: {
+            int16_t* p = reinterpret_cast<int16_t*>(m_data);
+            for (size_t i = begin; i != end; ++i)
+                p[i] = int16_t(p[i] + diff);
+            break;
+        }
+        case 32: {
+            int32_t* p = reinterpret_cast<int32_t*>(m_data);
+            for (size_t i = begin; i != end; ++i)
+                p[i] = int32_t(p[i] + diff);
+            break;
+        }
+        case 64: {
+            int64_t* p = reinterpret_cast<int64_t*>(m_data);
+            for (size_t i = begin; i != end; ++i)
+                p[i] += diff;
+            break;
+        }
+        default:
+            // sub-byte widths: the width cannot change here, so a plain
+            // setter loop suffices (COW already done)
+            for (size_t i = begin; i != end; ++i)
+                (this->*(m_vtable->setter))(i, (this->*m_getter)(i) + diff);
+            break;
+    }
+}
+
 size_t Array::blob_size() const noexcept
 {
     if (get_context_flag()) {
@@ -415,6 +474,25 @@ size_t Array::blob_size() const noexcept
         return m_size;
     }
 }
+
+namespace {
+// Shift the bit range [pos_bits, used_bits) of a little-endian packed bit
+// stream up by `width` bits (width in {1,2,4}), opening a gap for one
+// element. The caller must have ensured capacity for used_bits + width.
+void open_bit_gap(char* data, size_t used_bits, size_t pos_bits, size_t width)
+{
+    uint64_t* words = reinterpret_cast<uint64_t*>(data);
+    size_t first_word = pos_bits / 64;
+    size_t last_word = (used_bits + width - 1) / 64;
+    for (size_t k = last_word; k > first_word; --k) {
+        words[k] = (words[k] << width) | (words[k - 1] >> (64 - width));
+    }
+    uint64_t word = words[first_word];
+    size_t off = pos_bits % 64;
+    uint64_t keep = off ? (~uint64_t(0) >> (64 - off)) : 0;
+    words[first_word] = (word & keep) | ((word & ~keep) << width);
+}
+} // anonymous namespace
 
 void Array::insert(size_t ndx, int_fast64_t value)
 {
@@ -435,13 +513,19 @@ void Array::insert(size_t ndx, int_fast64_t value)
     }
 
     // Move values below insertion (may expand)
-    if (do_expand || old_width < 8) {
+    if (do_expand) {
         size_t i = old_size;
         while (i > ndx) {
             --i;
             int64_t v = (this->*old_getter)(i);
             (this->*(m_vtable->setter))(i + 1, v);
         }
+    }
+    else if (old_width < 8) {
+        // sub-byte widths: shift the packed bits in bulk (width 0 stores
+        // nothing, so there is nothing to move)
+        if (old_width != 0 && ndx != old_size)
+            open_bit_gap(m_data, old_size * old_width, ndx * old_width, old_width);
     }
     else if (ndx != old_size) {
         // when byte sized and no expansion, use memmove

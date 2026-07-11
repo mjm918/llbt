@@ -920,16 +920,6 @@ inline void Array::adjust(size_t ndx, int_fast64_t diff)
     }
 }
 
-inline void Array::adjust(size_t begin, size_t end, int_fast64_t diff)
-{
-    if (diff != 0) {
-        // FIXME: Should be optimized
-        for (size_t i = begin; i != end; ++i)
-            adjust(i, diff); // Throws
-    }
-}
-
-
 //-------------------------------------------------
 
 

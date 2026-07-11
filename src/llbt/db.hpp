@@ -39,6 +39,7 @@
 namespace llbt {
 
 class Transaction;
+class WriteWindowMgr;
 using TransactionRef = std::shared_ptr<Transaction>;
 
 /// Thrown by DB::create() if the lock file is already open in another
@@ -502,6 +503,9 @@ private:
     int m_transaction_count GUARDED_BY(m_mutex) = 0;
     SlabAlloc m_alloc;
     std::unique_ptr<Replication> m_history;
+    // Write-window cache reused across commits (created on first commit).
+    // Must be dropped before the data file is detached or replaced.
+    std::unique_ptr<WriteWindowMgr> m_write_window_mgr;
     std::unique_ptr<VersionManager> m_version_manager;
     std::unique_ptr<EncryptionMarkerObserver> m_marker_observer;
     Replication* m_replication = nullptr;

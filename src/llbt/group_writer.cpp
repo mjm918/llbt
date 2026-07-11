@@ -69,7 +69,7 @@ private:
 // Class controlling a memory mapped window into a file
 class WriteWindowMgr::MapWindow {
 public:
-    MapWindow(size_t alignment, util::File& f, ref_type start_ref, size_t initial_size,
+    MapWindow(WriteWindowMgr& mgr, util::File& f, ref_type start_ref, size_t initial_size,
               util::WriteMarker* write_marker = nullptr);
     ~MapWindow();
 
@@ -89,11 +89,16 @@ public:
     // requested size - extends if possible and then returns true
     bool extends_to_match(util::File& f, ref_type start_ref, size_t size);
 
+    // Written through since the last sync? Windows can now outlive a commit,
+    // so sync/flush passes and unmap-syncs skip windows nothing touched.
+    bool m_touched = true;
+
 private:
+    WriteWindowMgr& m_mgr;
     util::File::Map<char> m_map;
     ref_type m_base_ref;
     ref_type aligned_to_mmap_block(ref_type start_ref);
-    size_t get_window_size(util::File& f, ref_type start_ref, size_t size);
+    size_t get_window_size(ref_type start_ref, size_t size);
     size_t m_alignment;
 };
 
@@ -121,18 +126,31 @@ ref_type WriteWindowMgr::MapWindow::aligned_to_mmap_block(ref_type start_ref)
     return start_ref & ~page_mask;
 }
 
-size_t WriteWindowMgr::MapWindow::get_window_size(util::File& f, ref_type start_ref, size_t size)
+size_t WriteWindowMgr::MapWindow::get_window_size(ref_type start_ref, size_t size)
 {
     size_t window_size = start_ref + size - m_base_ref;
     // always map at least to match alignment
     if (window_size < m_alignment)
         window_size = m_alignment;
     // but never map beyond end of file
-    size_t file_size = to_size_t(f.get_size());
-    LLBT_ASSERT_DEBUG_EX(start_ref + size <= file_size, start_ref + size, file_size);
+    size_t file_size = m_mgr.known_file_size(start_ref + size);
     if (window_size > file_size - m_base_ref)
         window_size = file_size - m_base_ref;
     return window_size;
+}
+
+size_t WriteWindowMgr::known_file_size(size_t required_size)
+{
+    if (required_size > m_cached_file_size) {
+        m_cached_file_size = to_size_t(m_alloc.get_file().get_size());
+        LLBT_ASSERT_DEBUG_EX(required_size <= m_cached_file_size, required_size, m_cached_file_size);
+    }
+    return m_cached_file_size;
+}
+
+bool WriteWindowMgr::needs_sync_on_unmap() const
+{
+    return m_durability == Durability::Full && !get_disable_sync_to_disk();
 }
 
 // The file may grow in increments much smaller than 1MB. This can lead to a stream of requests
@@ -148,19 +166,32 @@ bool WriteWindowMgr::MapWindow::extends_to_match(util::File& f, ref_type start_r
     size_t aligned_ref = aligned_to_mmap_block(start_ref);
     if (aligned_ref != m_base_ref)
         return false;
-    size_t window_size = get_window_size(f, start_ref, size);
-    m_map.sync();
+    size_t window_size = get_window_size(start_ref, size);
+    // Map the replacement first. If mmap throws, this window remains valid.
+    util::File::Map<char> replacement;
+    replacement.map(f, File::access_ReadWrite, window_size, m_base_ref);
+#if LLBT_ENABLE_ENCRYPTION
+    if (auto p = replacement.get_encrypted_mapping())
+        p->set_marker(m_mgr.m_write_marker);
+#endif
+    // The remap drops this mapping; dirty pages survive in the page cache,
+    // but Full durability keeps the conservative sync-before-unmap.
+    if (m_touched && m_mgr.needs_sync_on_unmap())
+        m_map.sync();
+    else
+        m_map.flush();
     m_map.unmap();
-    m_map.map(f, File::access_ReadWrite, window_size, m_base_ref);
+    m_map = std::move(replacement);
     return true;
 }
 
-WriteWindowMgr::MapWindow::MapWindow(size_t alignment, util::File& f, ref_type start_ref, size_t size,
+WriteWindowMgr::MapWindow::MapWindow(WriteWindowMgr& mgr, util::File& f, ref_type start_ref, size_t size,
                                      util::WriteMarker* write_marker)
-    : m_alignment(alignment)
+    : m_mgr(mgr)
+    , m_alignment(mgr.m_window_alignment)
 {
     m_base_ref = aligned_to_mmap_block(start_ref);
-    size_t window_size = get_window_size(f, start_ref, size);
+    size_t window_size = get_window_size(start_ref, size);
     m_map.map(f, File::access_ReadWrite, window_size, m_base_ref);
 #if LLBT_ENABLE_ENCRYPTION
     if (auto p = m_map.get_encrypted_mapping())
@@ -172,7 +203,9 @@ WriteWindowMgr::MapWindow::MapWindow(size_t alignment, util::File& f, ref_type s
 
 WriteWindowMgr::MapWindow::~MapWindow()
 {
-    m_map.sync();
+    // Successful commits and LRU eviction sync explicitly. A destructor must
+    // not call throwing msync() (destructors are noexcept); encrypted unmap
+    // still flushes its private dirty pages into the shared file image.
     m_map.unmap();
 }
 
@@ -229,21 +262,29 @@ WriteWindowMgr::WriteWindowMgr(SlabAlloc& alloc, Durability dura, WriteMarker* w
 #endif
 }
 
-GroupCommitter::GroupCommitter(Transaction& group, Durability dura, WriteMarker* write_marker)
+WriteWindowMgr::~WriteWindowMgr() = default;
+
+GroupCommitter::GroupCommitter(Transaction& group, Durability dura, WriteMarker* write_marker,
+                               WriteWindowMgr* shared_window_mgr)
     : m_group(group)
     , m_alloc(group.m_alloc)
     , m_durability(dura)
-    , m_window_mgr(group.m_alloc, dura, write_marker)
+    , m_owned_window_mgr(shared_window_mgr ? nullptr
+                                           : std::make_unique<WriteWindowMgr>(group.m_alloc, dura, write_marker))
+    , m_window_mgr(shared_window_mgr ? *shared_window_mgr : *m_owned_window_mgr)
 {
 }
 
 GroupCommitter::~GroupCommitter() = default;
 
-GroupWriter::GroupWriter(Transaction& group, Durability dura, WriteMarker* write_marker)
+GroupWriter::GroupWriter(Transaction& group, Durability dura, WriteMarker* write_marker,
+                         WriteWindowMgr* shared_window_mgr)
     : m_group(group)
     , m_alloc(group.m_alloc)
     , m_durability(dura)
-    , m_window_mgr(group.m_alloc, dura, write_marker)
+    , m_owned_window_mgr(shared_window_mgr ? nullptr
+                                           : std::make_unique<WriteWindowMgr>(group.m_alloc, dura, write_marker))
+    , m_window_mgr(shared_window_mgr ? *shared_window_mgr : *m_owned_window_mgr)
     , m_free_positions(m_alloc)
     , m_free_lengths(m_alloc)
     , m_free_versions(m_alloc)
@@ -309,8 +350,9 @@ void GroupWriter::sync_according_to_durability()
 {
     switch (m_durability) {
         case Durability::Full:
-        case Durability::Unsafe:
             m_window_mgr.sync_all_mappings();
+            break;
+        case Durability::Unsafe:
             break;
         case Durability::MemOnly:
             m_window_mgr.flush_all_mappings();
@@ -328,16 +370,24 @@ size_t GroupWriter::get_file_size() const noexcept
 void WriteWindowMgr::flush_all_mappings()
 {
     for (const auto& window : m_map_windows) {
-        window->flush();
+        if (window->m_touched)
+            window->flush();
     }
+}
+
+void WriteWindowMgr::clear_failed_mappings() noexcept
+{
+    m_map_windows.clear();
+    m_cached_file_size = 0;
 }
 
 void WriteWindowMgr::sync_all_mappings()
 {
-    if (m_durability == Durability::Unsafe)
-        return;
     for (const auto& window : m_map_windows) {
-        window->sync();
+        if (window->m_touched) {
+            window->sync();
+            window->m_touched = false;
+        }
     }
 }
 
@@ -353,15 +403,21 @@ WriteWindowMgr::MapWindow* WriteWindowMgr::get_window(ref_type start_ref, size_t
     if (match != m_map_windows.end()) {
         // move matching window to top (to keep LRU order)
         std::rotate(m_map_windows.begin(), match, match + 1);
+        m_map_windows[0]->m_touched = true;
         return m_map_windows[0].get();
     }
     // no window found, make room for a new one at the top
     if (m_map_windows.size() == num_map_windows) {
-        m_map_windows.back()->flush();
+        // Once evicted, a window cannot participate in a later async durable
+        // completion. Sync every touched victim even when the current write
+        // phase is Unsafe.
+        if (m_map_windows.back()->m_touched)
+            m_map_windows.back()->sync();
+        else
+            m_map_windows.back()->flush();
         m_map_windows.pop_back();
     }
-    auto new_window =
-        std::make_unique<MapWindow>(m_window_alignment, m_alloc.get_file(), start_ref, size, m_write_marker);
+    auto new_window = std::make_unique<MapWindow>(*this, m_alloc.get_file(), start_ref, size, m_write_marker);
     m_map_windows.insert(m_map_windows.begin(), std::move(new_window));
     return m_map_windows[0].get();
 }

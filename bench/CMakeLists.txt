@@ -1,6 +1,9 @@
 add_executable(llbt-bench bench.cpp)
 target_link_libraries(llbt-bench PRIVATE llbt::core)
 
+add_executable(llbt-bench-concurrency bench_concurrency.cpp)
+target_link_libraries(llbt-bench-concurrency PRIVATE llbt::core)
+
 # Optional side-by-side comparison vs LMDB (the truest peer engine).
 # Install it first: `brew install lmdb` or `apt install liblmdb-dev`.
 execute_process(COMMAND brew --prefix lmdb OUTPUT_VARIABLE _brew_lmdb

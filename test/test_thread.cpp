@@ -600,6 +600,28 @@ NONCONCURRENT_TEST(Thread_InterprocessMutexTryLock)
     m.release_shared_part();
 }
 
+NONCONCURRENT_TEST(Thread_InterprocessMutexMixedProcessModes)
+{
+    InterprocessMutex::SharedPart mutex_part;
+    InterprocessMutex normal;
+    InterprocessMutex single_process;
+    TEST_PATH(path);
+    const std::string name = "Test_Thread_InterprocessMutexMixedProcessModes";
+    normal.set_shared_part(mutex_part, path, name, false);
+    single_process.set_shared_part(mutex_part, path, name, true);
+
+    CHECK(normal.try_lock());
+    CHECK(!single_process.try_lock());
+    normal.unlock();
+
+    CHECK(single_process.try_lock());
+    CHECK(!normal.try_lock());
+    single_process.unlock();
+
+    normal.release_shared_part();
+    single_process.release_shared_part();
+}
+
 #endif
 
 // Detect and flag trivial implementations of condvars.

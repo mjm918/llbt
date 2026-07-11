@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 #include <thread>
@@ -245,27 +246,18 @@ static void bench_kv_string(Mode m, size_t K, size_t lookups, size_t vsize)
     }
     std::string val(vsize, 'x');
 
-    auto lower_bound = [](Tree<StringData>& t, StringData k) {
-        size_t lo = 0, hi = t.size();
-        while (lo < hi) {
-            size_t mid = (lo + hi) / 2;
-            if (t.get(mid) < k)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        return lo;
-    };
-
+    // One tree of packed key+value records; the fixed-width key is the record
+    // prefix, so lexicographic record order is key order.
+    std::string rec;
     auto t0 = Clock::now();
     {
         Tx tx = store->begin_write();
-        Tree<StringData> tk = tx.tree<StringData>("keys");
-        Tree<StringData> tv = tx.tree<StringData>("vals");
+        Tree<StringData> t = tx.tree<StringData>("kv");
         for (size_t i = 0; i < K; ++i) {
-            size_t p = lower_bound(tk, StringData(keys[i]));
-            tk.insert(p, StringData(keys[i]));
-            tv.insert(p, StringData(val));
+            rec.assign(keys[i]);
+            rec += val;
+            size_t p = t.lower_bound(StringData(keys[i]));
+            t.insert(p, StringData(rec));
         }
         tx.commit();
     }
@@ -278,22 +270,29 @@ static void bench_kv_string(Mode m, size_t K, size_t lookups, size_t vsize)
     std::vector<size_t> which(lookups);
     for (auto& x : which)
         x = pick(rng);
+    const size_t ksz = keys.empty() ? 0 : keys[0].size();
     Tx tx = store->begin_read();
-    Tree<StringData> tk = tx.tree<StringData>("keys");
-    Tree<StringData> tv = tx.tree<StringData>("vals");
+    Tree<StringData> t = tx.tree<StringData>("kv");
     int64_t sink = 0;
+    auto look = [&](size_t i) {
+        const std::string& key = keys[which[i]];
+        size_t p = t.lower_bound(StringData(key));
+        if (p == t.size())
+            std::abort();
+        StringData record = t.get(p);
+        if (record.size() < ksz || std::memcmp(record.data(), key.data(), ksz) != 0)
+            std::abort();
+        sink += int64_t(record.size() - ksz);
+    };
     for (size_t i = 0; i < lookups / 10; ++i) { // warm-up
-        size_t p = lower_bound(tk, StringData(keys[which[i]]));
-        sink += tv.get(p).size();
+        look(i);
     }
     auto t1 = Clock::now();
-    for (size_t i = 0; i < lookups; ++i) {
-        size_t p = lower_bound(tk, StringData(keys[which[i]]));
-        sink += tv.get(p).size();
-    }
-    double look = secs(Clock::now() - t1);
+    for (size_t i = 0; i < lookups; ++i)
+        look(i);
+    double lookup_s = secs(Clock::now() - t1);
     g_sink += sink;
-    row("kv-string-lookup", mode_name(m), lookups, look, -1, -1, -1,
+    row("kv-string-lookup", mode_name(m), lookups, lookup_s, -1, -1, -1,
         "16B key, " + std::to_string(vsize) + "B val");
 }
 
@@ -338,5 +337,6 @@ int main(int argc, char** argv)
         bench_kv_string(m, KVK, KVLOOK, 100);
 
     std::printf("\n(sink=%lld)\n", (long long)g_sink);
+    util::try_remove_dir_recursive(g_dir);
     return 0;
 }

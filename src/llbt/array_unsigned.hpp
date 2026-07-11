@@ -62,14 +62,7 @@ public:
     // override value at index
     void set(size_t ndx, uint64_t value);
 
-    void adjust(size_t begin, size_t end, int64_t diff)
-    {
-        if (diff != 0) {
-            // FIXME: Should be optimized
-            for (size_t i = begin; i < end; ++i)
-                adjust(i, diff); // Throws
-        }
-    }
+    void adjust(size_t begin, size_t end, int64_t diff);
 
     void truncate(size_t ndx);
 

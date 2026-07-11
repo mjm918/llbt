@@ -5,17 +5,15 @@
 // dataset, same machine, so the numbers mean something relative to each other.
 //
 // Fairness notes (read these before trusting a row):
-//   * Durability is NOT identical in `sync` mode. llbt commits with Apple's
-//     F_BARRIERFSYNC (an ordered barrier — crash-consistent). LMDB uses
-//     fsync(), which on macOS does NOT flush the drive's write cache. So in
-//     `sync` mode llbt is doing a stronger (slower) guarantee. The `nosync`
-//     rows (both skip the durability flush) isolate raw engine overhead and
-//     are the cleaner apples-to-apples.
-//   * Data model differs. llbt::core Tree<T> is a POSITIONAL sequence (index
-//     is the key); LMDB is a sorted key->value map. For dense integer keys
-//     (0..N-1) these coincide. For string keys llbt has no native sorted map,
-//     so we build one by hand (binary-search insert) — LMDB does it in one
-//     operation, and that gap is real and worth seeing.
+//   * Durability is NOT identical in native sync mode. On macOS llbt uses
+//     F_BARRIERFSYNC (write ordering), while stock LMDB uses F_FULLFSYNC
+//     (stronger persistence at return). Native-sync rows are shown but are
+//     deliberately not scored. The no-flush rows are the closer comparison.
+//   * Data model differs for dense integers. llbt::core Tree<T> stores only a
+//     value and uses its position as the key; LMDB stores and searches an
+//     explicit key plus value. Those native-API rows characterize each engine
+//     but are not scored as equivalent KV work. The string rows do represent
+//     the same logical 16-byte-key -> 100-byte-value map.
 //
 // Build: needs LMDB (brew install lmdb / apt install liblmdb-dev). CMake finds
 // it automatically and builds this target when present.
@@ -91,6 +89,8 @@ static StoreRef llbt_open(bool nosync)
 {
     Options o;
     o.no_sync = nosync;
+    // the LMDB side runs MDB_NOLOCK; this is the matching configuration
+    o.single_process = true;
     return Store::open(fresh("llbt"), o);
 }
 
@@ -111,11 +111,11 @@ static R llbt_seq_write(bool nosync, size_t N)
     return {N / sec, -1, nb};
 }
 
-static R llbt_commit(bool nosync, size_t C, size_t B)
+static R llbt_commit(bool nosync, size_t min_commits, size_t B, double min_seconds)
 {
     StoreRef s = llbt_open(nosync);
     std::vector<double> lat;
-    lat.reserve(C);
+    lat.reserve(min_commits);
     int64_t k = 0;
     for (int w = 0; w < 3; ++w) {
         Tx tx = s->begin_write();
@@ -125,17 +125,22 @@ static R llbt_commit(bool nosync, size_t C, size_t B)
         tx.commit();
     }
     auto t0 = Clock::now();
-    for (size_t c = 0; c < C; ++c) {
-        auto c0 = Clock::now();
-        Tx tx = s->begin_write();
-        Tree<int64_t> t = tx.tree<int64_t>("k");
-        for (size_t b = 0; b < B; ++b)
-            t.add(k++);
-        tx.commit();
-        lat.push_back(secs(Clock::now() - c0));
-    }
-    double tot = secs(Clock::now() - t0);
-    return {C / tot, pctl(lat, 0.50), ""};
+    size_t commits = 0;
+    double tot = 0;
+    do {
+        for (size_t chunk = 0; chunk < 64; ++chunk) {
+            auto c0 = Clock::now();
+            Tx tx = s->begin_write();
+            Tree<int64_t> t = tx.tree<int64_t>("k");
+            for (size_t b = 0; b < B; ++b)
+                t.add(k++);
+            tx.commit();
+            lat.push_back(secs(Clock::now() - c0));
+            ++commits;
+        }
+        tot = secs(Clock::now() - t0);
+    } while (commits < min_commits || tot < min_seconds);
+    return {commits / tot, pctl(lat, 0.50), ""};
 }
 
 static StoreRef llbt_populate(bool nosync, size_t N)
@@ -166,48 +171,47 @@ static R llbt_rand_read(size_t N, const std::vector<uint32_t>& idx)
     return {M / sec, -1, ""};
 }
 
-static R llbt_scan(size_t N)
+static R llbt_scan(size_t N, size_t passes)
 {
     StoreRef s = llbt_populate(false, N);
     Tx tx = s->begin_read();
     Tree<int64_t> t = tx.tree<int64_t>("k");
     int64_t sink = 0;
-    auto t0 = Clock::now();
     for (auto c = t.cursor(); c.valid(); c.next())
-        sink += c.value();
+        sink += c.value(); // warm-up
+    auto t0 = Clock::now();
+    for (size_t pass = 0; pass < passes; ++pass) {
+        for (auto c = t.cursor(); c.valid(); c.next())
+            sink += c.value();
+    }
     double sec = secs(Clock::now() - t0);
     g_sink += sink;
-    return {N / sec, -1, ""};
+    return {double(N) * passes / sec, -1, ""};
 }
 
 struct KV {
     R build, lookup;
 };
 
-static KV llbt_kv(size_t K, size_t L, size_t vsize, const std::vector<std::string>& keys, const std::vector<size_t>& which)
+static KV llbt_kv(bool nosync, size_t K, size_t L, size_t vsize, const std::vector<std::string>& keys,
+                  const std::vector<size_t>& which)
 {
-    StoreRef s = llbt_open(false);
+    StoreRef s = llbt_open(nosync);
     std::string val(vsize, 'x');
-    auto lb = [](Tree<StringData>& t, StringData k) {
-        size_t lo = 0, hi = t.size();
-        while (lo < hi) {
-            size_t m = (lo + hi) / 2;
-            if (t.get(m) < k)
-                lo = m + 1;
-            else
-                hi = m;
-        }
-        return lo;
-    };
+    // One tree of packed key+value records. Records sort by key because the
+    // fixed-width key is the record prefix. lower_bound(key) finds a candidate;
+    // the lookup below still verifies that prefix before reading the value.
+    const size_t ksz = keys.empty() ? 0 : keys[0].size();
+    std::string rec;
     auto t0 = Clock::now();
     {
         Tx tx = s->begin_write();
-        Tree<StringData> tk = tx.tree<StringData>("k");
-        Tree<StringData> tv = tx.tree<StringData>("v");
+        Tree<StringData> t = tx.tree<StringData>("kv");
         for (size_t i = 0; i < K; ++i) {
-            size_t p = lb(tk, StringData(keys[i]));
-            tk.insert(p, StringData(keys[i]));
-            tv.insert(p, StringData(val));
+            rec.assign(keys[i]);
+            rec += val;
+            size_t p = t.lower_bound(StringData(keys[i]));
+            t.insert(p, StringData(rec));
         }
         tx.commit();
     }
@@ -216,18 +220,24 @@ static KV llbt_kv(size_t K, size_t L, size_t vsize, const std::vector<std::strin
     std::snprintf(nb, sizeof nb, "%.1f MB", util::File::get_size_static(s->path()) / 1e6);
 
     Tx tx = s->begin_read();
-    Tree<StringData> tk = tx.tree<StringData>("k");
-    Tree<StringData> tv = tx.tree<StringData>("v");
+    Tree<StringData> t = tx.tree<StringData>("kv");
     int64_t sink = 0;
+    auto look = [&](size_t i) {
+        const std::string& key = keys[which[i]];
+        size_t p = t.lower_bound(StringData(key));
+        if (p == t.size())
+            std::abort();
+        StringData record = t.get(p);
+        if (record.size() < ksz || std::memcmp(record.data(), key.data(), ksz) != 0)
+            std::abort();
+        sink += int64_t(record.size() - ksz);
+    };
     for (size_t i = 0; i < L / 10; ++i) {
-        size_t p = lb(tk, StringData(keys[which[i]]));
-        sink += tv.get(p).size();
+        look(i);
     }
     auto t1 = Clock::now();
-    for (size_t i = 0; i < L; ++i) {
-        size_t p = lb(tk, StringData(keys[which[i]]));
-        sink += tv.get(p).size();
-    }
+    for (size_t i = 0; i < L; ++i)
+        look(i);
     double lsec = secs(Clock::now() - t1);
     g_sink += sink;
     return {{K / bsec, -1, nb}, {L / lsec, -1, ""}};
@@ -281,7 +291,7 @@ static R lmdb_seq_write(unsigned flags, size_t N)
     return {N / sec, -1, nb};
 }
 
-static R lmdb_commit(unsigned flags, size_t C, size_t B)
+static R lmdb_commit(unsigned flags, size_t min_commits, size_t B, double min_seconds)
 {
     LmdbEnv e(flags, size_t(1) << 30);
     MDB_dbi dbi;
@@ -292,7 +302,7 @@ static R lmdb_commit(unsigned flags, size_t C, size_t B)
         MCHECK(mdb_txn_commit(t));
     }
     std::vector<double> lat;
-    lat.reserve(C);
+    lat.reserve(min_commits);
     size_t k = 0;
     auto one = [&](bool timed) {
         auto c0 = Clock::now();
@@ -311,10 +321,16 @@ static R lmdb_commit(unsigned flags, size_t C, size_t B)
     for (int w = 0; w < 3; ++w)
         one(false);
     auto t0 = Clock::now();
-    for (size_t c = 0; c < C; ++c)
-        one(true);
-    double tot = secs(Clock::now() - t0);
-    return {C / tot, pctl(lat, 0.50), ""};
+    size_t commits = 0;
+    double tot = 0;
+    do {
+        for (size_t chunk = 0; chunk < 64; ++chunk) {
+            one(true);
+            ++commits;
+        }
+        tot = secs(Clock::now() - t0);
+    } while (commits < min_commits || tot < min_seconds);
+    return {commits / tot, pctl(lat, 0.50), ""};
 }
 
 static void lmdb_fill(LmdbEnv& e, size_t N, MDB_dbi& dbi)
@@ -359,7 +375,7 @@ static R lmdb_rand_read(size_t N, const std::vector<uint32_t>& idx)
     return {M / sec, -1, ""};
 }
 
-static R lmdb_scan(size_t N)
+static R lmdb_scan(size_t N, size_t passes)
 {
     LmdbEnv e(0, size_t(1) << 30);
     MDB_dbi dbi;
@@ -370,24 +386,32 @@ static R lmdb_scan(size_t N)
     MCHECK(mdb_cursor_open(rt, dbi, &cur));
     int64_t sink = 0;
     MDB_val k, v;
+    auto scan_once = [&] {
+        int rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
+        while (rc == 0) {
+            int64_t val;
+            std::memcpy(&val, v.mv_data, sizeof val);
+            sink += val;
+            rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
+        }
+        if (rc != MDB_NOTFOUND)
+            MCHECK(rc);
+    };
+    scan_once(); // warm-up
     auto t0 = Clock::now();
-    int rc = mdb_cursor_get(cur, &k, &v, MDB_FIRST);
-    while (rc == 0) {
-        int64_t val;
-        std::memcpy(&val, v.mv_data, sizeof val);
-        sink += val;
-        rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT);
-    }
+    for (size_t pass = 0; pass < passes; ++pass)
+        scan_once();
     double sec = secs(Clock::now() - t0);
     mdb_cursor_close(cur);
     mdb_txn_abort(rt);
     g_sink += sink;
-    return {N / sec, -1, ""};
+    return {double(N) * passes / sec, -1, ""};
 }
 
-static KV lmdb_kv(size_t K, size_t L, size_t vsize, const std::vector<std::string>& keys, const std::vector<size_t>& which)
+static KV lmdb_kv(bool nosync, size_t K, size_t L, size_t vsize, const std::vector<std::string>& keys,
+                  const std::vector<size_t>& which)
 {
-    LmdbEnv e(0, size_t(1) << 30);
+    LmdbEnv e(nosync ? MDB_NOSYNC : 0, size_t(1) << 30);
     std::string val(vsize, 'x');
     MDB_dbi dbi;
     auto t0 = Clock::now();
@@ -412,8 +436,10 @@ static KV lmdb_kv(size_t K, size_t L, size_t vsize, const std::vector<std::strin
     int64_t sink = 0;
     auto look = [&](size_t i) {
         MDB_val mk{keys[which[i]].size(), (void*)keys[which[i]].data()}, mv;
-        if (mdb_get(rt, dbi, &mk, &mv) == 0)
-            sink += mv.mv_size;
+        MCHECK(mdb_get(rt, dbi, &mk, &mv));
+        if (mv.mv_size != vsize)
+            std::abort();
+        sink += mv.mv_size;
     };
     for (size_t i = 0; i < L / 10; ++i)
         look(i);
@@ -428,18 +454,116 @@ static KV lmdb_kv(size_t K, size_t L, size_t vsize, const std::vector<std::strin
 
 // ---- side-by-side printing -----------------------------------------------
 
-static void header()
+enum class Basis { Comparable, DifferentSync, DifferentModel };
+
+struct PairResult {
+    R llbt;
+    R lmdb;
+    bool same_winner = false;
+};
+
+static R median(std::vector<R> runs)
 {
-    std::printf("%-16s %-7s %12s %12s   %-13s  %s\n", "workload", "mode", "llbt", "lmdb", "winner", "notes");
-    std::printf("------------------------------------------------------------------------------------------------\n");
+    std::sort(runs.begin(), runs.end(), [](const R& a, const R& b) {
+        return a.ops < b.ops;
+    });
+    return runs[runs.size() / 2];
 }
 
-static void cmp(const char* wl, const char* mode, const R& a, const R& b)
+template <class LlbtFn, class LmdbFn>
+static PairResult measure_pair(int samples, LlbtFn&& run_llbt, LmdbFn&& run_lmdb)
 {
-    const char* win = a.ops >= b.ops ? "llbt" : "lmdb";
-    double x = a.ops >= b.ops ? a.ops / b.ops : b.ops / a.ops;
-    char wbuf[24];
-    std::snprintf(wbuf, sizeof wbuf, "%s %.2fx", win, x);
+    std::vector<R> llbt_runs, lmdb_runs;
+    llbt_runs.reserve(samples);
+    lmdb_runs.reserve(samples);
+    bool direction = false;
+    bool same_winner = true;
+    for (int sample = 0; sample < samples; ++sample) {
+        R a, b;
+        if ((sample & 1) == 0) {
+            a = run_llbt();
+            b = run_lmdb();
+        }
+        else {
+            b = run_lmdb();
+            a = run_llbt();
+        }
+        const bool this_direction = a.ops >= b.ops;
+        if (sample == 0)
+            direction = this_direction;
+        else if (this_direction != direction)
+            same_winner = false;
+        llbt_runs.push_back(std::move(a));
+        lmdb_runs.push_back(std::move(b));
+    }
+    return {median(std::move(llbt_runs)), median(std::move(lmdb_runs)), same_winner};
+}
+
+struct KVPairResult {
+    PairResult build;
+    PairResult lookup;
+};
+
+template <class LlbtFn, class LmdbFn>
+static KVPairResult measure_kv_pair(int samples, LlbtFn&& run_llbt, LmdbFn&& run_lmdb)
+{
+    std::vector<R> ab, al, bb, bl;
+    bool build_direction = false, lookup_direction = false;
+    bool build_same = true, lookup_same = true;
+    for (int sample = 0; sample < samples; ++sample) {
+        KV a, b;
+        if ((sample & 1) == 0) {
+            a = run_llbt();
+            b = run_lmdb();
+        }
+        else {
+            b = run_lmdb();
+            a = run_llbt();
+        }
+        const bool bd = a.build.ops >= b.build.ops;
+        const bool ld = a.lookup.ops >= b.lookup.ops;
+        if (sample == 0) {
+            build_direction = bd;
+            lookup_direction = ld;
+        }
+        else {
+            build_same = build_same && bd == build_direction;
+            lookup_same = lookup_same && ld == lookup_direction;
+        }
+        ab.push_back(std::move(a.build));
+        al.push_back(std::move(a.lookup));
+        bb.push_back(std::move(b.build));
+        bl.push_back(std::move(b.lookup));
+    }
+    return {{median(std::move(ab)), median(std::move(bb)), build_same},
+            {median(std::move(al)), median(std::move(bl)), lookup_same}};
+}
+
+static void header()
+{
+    std::printf("%-16s %-9s %12s %12s   %-16s  %s\n", "workload", "mode", "llbt", "lmdb", "result", "notes");
+    std::printf("-----------------------------------------------------------------------------------------------------\n");
+}
+
+static void cmp(const char* wl, const char* mode, const PairResult& pair, Basis basis)
+{
+    const R& a = pair.llbt;
+    const R& b = pair.lmdb;
+    char result[32];
+    if (basis == Basis::DifferentSync) {
+        std::snprintf(result, sizeof result, "not comparable");
+    }
+    else if (basis == Basis::DifferentModel) {
+        std::snprintf(result, sizeof result, "native APIs");
+    }
+    else if (!pair.same_winner) {
+        std::snprintf(result, sizeof result, "mixed samples");
+    }
+    else {
+        const char* win = a.ops >= b.ops ? "llbt" : "lmdb";
+        double x = a.ops >= b.ops ? a.ops / b.ops : b.ops / a.ops;
+        std::snprintf(result, sizeof result, "%s %.2fx", win, x);
+    }
 
     std::string note;
     if (!a.note.empty())
@@ -449,8 +573,8 @@ static void cmp(const char* wl, const char* mode, const R& a, const R& b)
     if (a.p50 >= 0 || b.p50 >= 0)
         note += (note.empty() ? "" : "  ") + std::string("p50 ") + t_str(a.p50) + "/" + t_str(b.p50);
 
-    std::printf("%-16s %-7s %12s %12s   %-13s  %s\n", wl, mode, rate(a.ops).c_str(), rate(b.ops).c_str(), wbuf,
-                note.c_str());
+    std::printf("%-16s %-9s %12s %12s   %-16s  %s\n", wl, mode, rate(a.ops).c_str(), rate(b.ops).c_str(),
+                result, note.c_str());
 }
 
 int main(int argc, char** argv)
@@ -458,15 +582,18 @@ int main(int argc, char** argv)
     double scale = (argc > 1) ? std::atof(argv[1]) : 1.0;
     if (scale <= 0)
         scale = 1.0;
-    auto S = [&](size_t base) { return size_t(base * scale); };
+    auto S = [&](size_t base) { return std::max(size_t(1), size_t(base * scale)); };
 
     g_dir = util::make_temp_dir();
 
+    const int SAMPLES = 3;
     const size_t N = S(1'000'000);
-    const size_t READS = S(1'000'000);
-    const size_t C = S(1'000);
+    const size_t READS = S(3'000'000);
+    const size_t MIN_COMMITS = S(128);
+    const double MIN_COMMIT_SECONDS = 0.35 * std::max(0.25, scale);
+    const size_t SCAN_PASSES = S(50);
     const size_t KVK = S(200'000);
-    const size_t KVL = S(500'000);
+    const size_t KVL = S(1'000'000);
 
     std::mt19937_64 rng(12345);
     std::uniform_int_distribution<uint32_t> d(0, uint32_t(N - 1));
@@ -474,11 +601,12 @@ int main(int argc, char** argv)
     for (auto& x : idx)
         x = d(rng);
     std::vector<std::string> keys(KVK);
-    for (auto& s : keys) {
-        s.resize(16);
-        for (auto& c : s)
-            c = char('a' + rng() % 26);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        char key[17];
+        std::snprintf(key, sizeof key, "%016llx", (unsigned long long)i);
+        keys[i] = key;
     }
+    std::shuffle(keys.begin(), keys.end(), rng);
     std::vector<size_t> which(KVL);
     {
         std::uniform_int_distribution<size_t> p(0, KVK - 1);
@@ -486,30 +614,61 @@ int main(int argc, char** argv)
             x = p(rng);
     }
 
-    std::printf("llbt vs LMDB %s   Apple/arm64, %u cores, scale=%.2f, Release, warm cache\n", MDB_VERSION_STRING,
+    std::printf("llbt vs LMDB %s   %u cores, scale=%.2f, Release\n", MDB_VERSION_STRING,
                 std::thread::hardware_concurrency(), scale);
-    std::printf("sync: llbt=F_BARRIERFSYNC (stronger), lmdb=fsync() (weaker on macOS) — not identical durability.\n");
-    std::printf("nosync rows isolate raw engine overhead (both skip the durability flush).\n\n");
+    std::printf("median of %d fresh-DB samples; engine order alternates; commit samples run at least %.2fs.\n",
+                SAMPLES, MIN_COMMIT_SECONDS);
+#if defined(__APPLE__)
+    std::printf("native sync is unscored: llbt=F_BARRIERFSYNC ordering, LMDB=F_FULLFSYNC persistence.\n");
+#else
+    std::printf("native sync is unscored because the engines use different synchronization paths.\n");
+#endif
+    std::printf("integer rows are unscored native APIs: llbt positional values vs LMDB explicit key/value.\n");
+    std::printf("single-process tuning: llbt process mutexes; LMDB MDB_NOLOCK.\n\n");
 
     header();
-    cmp("seq-write", "sync", llbt_seq_write(false, N), lmdb_seq_write(0, N));
-    cmp("seq-write", "nosync", llbt_seq_write(true, N), lmdb_seq_write(MDB_NOSYNC, N));
+    cmp("seq-write", "native",
+        measure_pair(SAMPLES, [&] { return llbt_seq_write(false, N); }, [&] { return lmdb_seq_write(0, N); }),
+        Basis::DifferentSync);
+    cmp("seq-write", "no-flush",
+        measure_pair(SAMPLES, [&] { return llbt_seq_write(true, N); },
+                     [&] { return lmdb_seq_write(MDB_NOSYNC, N); }),
+        Basis::DifferentModel);
     std::printf("\n");
-    cmp("commit(b=1)", "sync", llbt_commit(false, C, 1), lmdb_commit(0, C, 1));
-    cmp("commit(b=1)", "nosync", llbt_commit(true, C, 1), lmdb_commit(MDB_NOSYNC, C, 1));
-    cmp("commit(b=100)", "sync", llbt_commit(false, C, 100), lmdb_commit(0, C, 100));
-    cmp("commit(b=100)", "nosync", llbt_commit(true, C, 100), lmdb_commit(MDB_NOSYNC, C, 100));
+    cmp("commit(b=1)", "native",
+        measure_pair(SAMPLES, [&] { return llbt_commit(false, MIN_COMMITS, 1, MIN_COMMIT_SECONDS); },
+                     [&] { return lmdb_commit(0, MIN_COMMITS, 1, MIN_COMMIT_SECONDS); }),
+        Basis::DifferentSync);
+    cmp("commit(b=1)", "no-flush",
+        measure_pair(SAMPLES, [&] { return llbt_commit(true, MIN_COMMITS, 1, MIN_COMMIT_SECONDS); },
+                     [&] { return lmdb_commit(MDB_NOSYNC, MIN_COMMITS, 1, MIN_COMMIT_SECONDS); }),
+        Basis::DifferentModel);
+    cmp("commit(b=100)", "native",
+        measure_pair(SAMPLES, [&] { return llbt_commit(false, MIN_COMMITS, 100, MIN_COMMIT_SECONDS); },
+                     [&] { return lmdb_commit(0, MIN_COMMITS, 100, MIN_COMMIT_SECONDS); }),
+        Basis::DifferentSync);
+    cmp("commit(b=100)", "no-flush",
+        measure_pair(SAMPLES, [&] { return llbt_commit(true, MIN_COMMITS, 100, MIN_COMMIT_SECONDS); },
+                     [&] { return lmdb_commit(MDB_NOSYNC, MIN_COMMITS, 100, MIN_COMMIT_SECONDS); }),
+        Basis::DifferentModel);
     std::printf("\n");
-    cmp("rand-read", "-", llbt_rand_read(N, idx), lmdb_rand_read(N, idx));
-    cmp("seq-scan", "-", llbt_scan(N), lmdb_scan(N));
+    cmp("rand-read", "native",
+        measure_pair(SAMPLES, [&] { return llbt_rand_read(N, idx); }, [&] { return lmdb_rand_read(N, idx); }),
+        Basis::DifferentModel);
+    cmp("seq-scan", "native",
+        measure_pair(SAMPLES, [&] { return llbt_scan(N, SCAN_PASSES); },
+                     [&] { return lmdb_scan(N, SCAN_PASSES); }),
+        Basis::DifferentModel);
     std::printf("\n");
     {
-        KV a = llbt_kv(KVK, KVL, 100, keys, which);
-        KV b = lmdb_kv(KVK, KVL, 100, keys, which);
-        cmp("kv-str-build", "sync", a.build, b.build);
-        cmp("kv-str-lookup", "-", a.lookup, b.lookup);
+        KVPairResult kv = measure_kv_pair(
+            SAMPLES, [&] { return llbt_kv(true, KVK, KVL, 100, keys, which); },
+            [&] { return lmdb_kv(true, KVK, KVL, 100, keys, which); });
+        cmp("kv-str-build", "no-flush", kv.build, Basis::Comparable);
+        cmp("kv-str-lookup", "-", kv.lookup, Basis::Comparable);
     }
 
     std::printf("\n(sink=%lld)\n", (long long)g_sink);
+    util::try_remove_dir_recursive(g_dir);
     return 0;
 }

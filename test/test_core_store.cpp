@@ -17,6 +17,7 @@
 
 #include <llbt/core.hpp>
 #include <llbt/array_binary.hpp>
+#include <llbt/impl/simulated_failure.hpp>
 
 #include "test.hpp"
 
@@ -128,6 +129,103 @@ TEST(CoreStore_CursorIteration)
     CHECK_EQUAL(cur.value(), "cherry");
     cur.seek(0);
     CHECK_EQUAL(cur.value(), "apple");
+}
+
+TEST(CoreStore_TreeLowerBound)
+{
+    TEST_PATH(path);
+    StoreRef store = Store::open(path);
+
+    // empty tree
+    {
+        Tx tx = store->begin_write();
+        Tree<StringData> t = tx.tree<StringData>("map");
+        CHECK_EQUAL(t.lower_bound("anything"), 0);
+        tx.commit();
+    }
+
+    // build a sorted map from shuffled keys via insert(lower_bound(k), k) —
+    // enough keys to force a multi-level tree (> LLBT_MAX_BPNODE_SIZE)
+    const size_t N = 5000;
+    std::vector<std::string> keys(N);
+    std::mt19937_64 rng(4711);
+    for (auto& s : keys) {
+        s.resize(16);
+        for (auto& c : s)
+            c = char('a' + rng() % 26);
+    }
+    {
+        Tx tx = store->begin_write();
+        Tree<StringData> t = tx.tree<StringData>("map");
+        for (auto& k : keys)
+            t.insert(t.lower_bound(StringData(k)), StringData(k));
+        CHECK_EQUAL(t.size(), N);
+        tx.commit();
+    }
+
+    std::vector<std::string> sorted = keys;
+    std::sort(sorted.begin(), sorted.end());
+
+    Tx tx = store->begin_read();
+    Tree<StringData> t = tx.tree<StringData>("map");
+    // the tree must have ended up in sorted order
+    for (size_t i = 0; i < N; ++i)
+        CHECK_EQUAL(t.get(i), StringData(sorted[i]));
+    // lower_bound agrees with std::lower_bound for present keys...
+    for (size_t i = 0; i < N; i += 7) {
+        size_t expected = std::lower_bound(sorted.begin(), sorted.end(), keys[i]) - sorted.begin();
+        CHECK_EQUAL(t.lower_bound(StringData(keys[i])), expected);
+    }
+    // ...and for absent probes, including before-first and past-last
+    std::vector<std::string> probes = {"", "a", "zzzzzzzzzzzzzzzzzz", "mmmmmmmm"};
+    for (size_t i = 0; i < 100; ++i) {
+        std::string p(1 + rng() % 20, ' ');
+        for (auto& c : p)
+            c = char('a' + rng() % 26);
+        probes.push_back(p);
+    }
+    for (auto& p : probes) {
+        size_t expected = std::lower_bound(sorted.begin(), sorted.end(), p) - sorted.begin();
+        CHECK_EQUAL(t.lower_bound(StringData(p)), expected);
+    }
+    // duplicates: lower_bound must point at the first occurrence
+    {
+        Tx wx = store->begin_write();
+        Tree<StringData> w = wx.tree<StringData>("map");
+        StringData dup(sorted[N / 2]);
+        w.insert(w.lower_bound(dup), dup);
+        w.insert(w.lower_bound(dup), dup);
+        size_t first = w.lower_bound(dup);
+        CHECK_EQUAL(w.get(first), dup);
+        CHECK_EQUAL(w.get(first + 1), dup);
+        CHECK_EQUAL(w.get(first + 2), dup);
+        CHECK(first == 0 || w.get(first - 1) < dup);
+
+        // Force equal values across several leaf boundaries. The inner-node
+        // search must enter the child before the first child beginning with
+        // the probe, because that earlier child can end with duplicates.
+        Tree<StringData> dups = wx.tree<StringData>("dups");
+        for (size_t i = 0; i < 1500; ++i)
+            dups.add("a");
+        for (size_t i = 0; i < 2500; ++i)
+            dups.add("m");
+        for (size_t i = 0; i < 1500; ++i)
+            dups.add("z");
+        CHECK_EQUAL(dups.lower_bound("a"), 0);
+        CHECK_EQUAL(dups.lower_bound("m"), 1500);
+        CHECK_EQUAL(dups.lower_bound("z"), 4000);
+        CHECK_EQUAL(dups.lower_bound("zz"), 5500);
+
+        // lower_bound is part of the generic Tree<T> API, not string-only.
+        Tree<int64_t> ints = wx.tree<int64_t>("ints");
+        for (int64_t i = 0; i < 3000; ++i)
+            ints.add(i * 2);
+        CHECK_EQUAL(ints.lower_bound(-1), 0);
+        CHECK_EQUAL(ints.lower_bound(0), 0);
+        CHECK_EQUAL(ints.lower_bound(1999), 1000);
+        CHECK_EQUAL(ints.lower_bound(6000), 3000);
+        wx.rollback();
+    }
 }
 
 TEST(CoreStore_MVCCSnapshotIsolation)
@@ -353,5 +451,77 @@ TEST(CoreStore_InMemoryMVCC)
     CHECK_EQUAL(reader.tree<int64_t>("n").size(), 100);
     CHECK_EQUAL(store->begin_read().tree<int64_t>("n").size(), 200);
 }
+
+#if LLBT_ENABLE_ENCRYPTION
+TEST(CoreStore_EncryptedAsyncCommitFlushesSharedWindows)
+{
+    TEST_PATH(path);
+    Options options;
+    options.encryption_key = crypt_key(true);
+    options.no_sync = true;
+    options.single_process = true;
+    {
+        StoreRef store = Store::open(path, options);
+        Tx tx = store->begin_write();
+        Tree<int64_t> values = tx.tree<int64_t>("values");
+        for (int64_t i = 0; i < 5000; ++i)
+            values.add(i * 7);
+        tx.raw().commit_and_continue_as_read(false);
+        tx.raw().prepare_for_close();
+    }
+    {
+        StoreRef store = Store::open(path, options);
+        Tx tx = store->begin_read();
+        Tree<int64_t> values = tx.tree<int64_t>("values");
+        CHECK_EQUAL(values.size(), 5000);
+        CHECK_EQUAL(values.get(4999), 4999 * 7);
+    }
+}
+
+TEST_IF(CoreStore_EncryptedFailedCommitDropsWindowCache, _impl::SimulatedFailure::is_enabled())
+{
+    TEST_PATH(path);
+    Options options;
+    options.encryption_key = crypt_key(true);
+    options.no_sync = true;
+    options.single_process = true;
+    StoreRef a = Store::open(path, options);
+    StoreRef b = Store::open(path, options);
+    {
+        Tx tx = a->begin_write();
+        Tree<int64_t> values = tx.tree<int64_t>("values");
+        for (int64_t i = 0; i < 5000; ++i)
+            values.add(i);
+        tx.commit();
+    }
+    {
+        Tx tx = a->begin_write();
+        Tree<int64_t> values = tx.tree<int64_t>("values");
+        for (size_t i = 0; i < values.size(); ++i)
+            values.set(i, 111111);
+        _impl::SimulatedFailure::OneShotPrimeGuard fail(_impl::SimulatedFailure::group_writer__commit);
+        CHECK_THROW_ANY(tx.commit());
+        tx.rollback();
+    }
+    {
+        Tx tx = b->begin_write();
+        Tree<int64_t> values = tx.tree<int64_t>("values");
+        for (size_t i = 0; i < values.size(); ++i)
+            values.set(i, 222222);
+        tx.commit();
+    }
+
+    // Close the failed writer after the successful one committed. A stale
+    // encrypted window cache must not overwrite the later commit here.
+    a.reset();
+    b.reset();
+    StoreRef reopened = Store::open(path, options);
+    Tx tx = reopened->begin_read();
+    Tree<int64_t> values = tx.tree<int64_t>("values");
+    CHECK_EQUAL(values.size(), 5000);
+    for (size_t i = 0; i < values.size(); ++i)
+        CHECK_EQUAL(values.get(i), 222222);
+}
+#endif
 
 #endif // TEST_CORE_STORE

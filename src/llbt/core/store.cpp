@@ -140,6 +140,7 @@ StoreRef Store::open(const std::string& path, const Options& options)
     db_options.encryption_key = options.encryption_key;
     if (options.no_sync)
         db_options.durability = DBOptions::Durability::Unsafe;
+    db_options.single_process = options.single_process;
     store->m_db = DB::create(*store->m_repl, path, db_options);
     return store;
 }

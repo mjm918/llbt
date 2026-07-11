@@ -1004,8 +1004,15 @@ void EncryptedFileMapping::read_barrier(const void* addr, size_t size, bool to_m
         PageState& ps = m_page_state[local_ndx];
         if (is_not(ps, UpToDate))
             refresh_page(local_ndx, to_modify);
-        if (to_modify)
+    }
+    // Mark pages writable only after every refresh succeeded. Otherwise a
+    // decryption error on a later page leaves earlier pages Writable and the
+    // mapping cannot be safely destroyed during exception cleanup.
+    if (to_modify) {
+        for (size_t local_ndx = begin; local_ndx <= end; ++local_ndx) {
+            PageState& ps = m_page_state[local_ndx];
             set(ps, Writable);
+        }
     }
 }
 

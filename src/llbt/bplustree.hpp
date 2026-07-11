@@ -20,6 +20,7 @@
 #define LLBT_BPLUSTREE_HPP
 
 #include <llbt/aggregate_ops.hpp>
+#include <llbt/array_unsigned.hpp>
 #include <llbt/column_type_traits.hpp>
 #include <llbt/decimal128.hpp>
 #include <llbt/timestamp.hpp>
@@ -614,6 +615,66 @@ public:
         return result;
     }
 
+    /// Lowest index whose element compares greater than or equal to `value`
+    /// (like std::lower_bound). Meaningful only while the caller keeps the
+    /// elements sorted — e.g. by always inserting at the returned index; the
+    /// tree itself does not enforce an ordering.
+    size_t lower_bound(T value) const
+    {
+        if (m_size == 0)
+            return 0;
+        size_t base = 0;
+        ref_type ref = m_root->get_ref();
+        char* header = m_alloc.translate(ref);
+        while (NodeHeader::get_is_inner_bptree_node_from_header(header)) {
+            // inner node layout: slot 0 = offsets ref or tagged
+            // elems-per-child, slots [1, n-1) = children, last slot =
+            // tagged tree size
+            const size_t nchildren = NodeHeader::get_size_from_header(header) - 2;
+            // Pick the child immediately before the first child whose first
+            // element is >= value. That earlier child can end in values equal
+            // to `value`; choosing a child which begins with `value` would
+            // skip duplicates spanning a child boundary.
+            size_t left = 1, right = nchildren;
+            while (left < right) {
+                const size_t mid = left + (right - left) / 2;
+                const ref_type child_ref = to_ref(Array::get(header, mid + 1));
+                if (subtree_first_value(child_ref) < value)
+                    left = mid + 1;
+                else
+                    right = mid;
+            }
+            const size_t child_ndx = left - 1;
+            if (child_ndx > 0) {
+                const int64_t slot0 = Array::get(header, 0);
+                if (slot0 & 1) {
+                    // compact form: equal number of elements per child
+                    base += size_t(slot0 >> 1) * child_ndx;
+                }
+                else {
+                    // offsets array holds cumulative counts; entry c-1 is
+                    // where child c starts
+                    ArrayUnsigned offsets(m_alloc);
+                    offsets.init_from_ref(to_ref(slot0));
+                    base += size_t(offsets.get(child_ndx - 1));
+                }
+            }
+            ref = to_ref(Array::get(header, child_ndx + 1));
+            header = m_alloc.translate(ref);
+        }
+        LeafArray leaf(m_alloc);
+        leaf.init_from_ref(ref);
+        size_t left = 0, right = leaf.size();
+        while (left < right) {
+            const size_t mid = left + (right - left) / 2;
+            if (leaf.get(mid) < value)
+                left = mid + 1;
+            else
+                right = mid;
+        }
+        return base + left;
+    }
+
     template <typename Func>
     void find_all(T value, Func&& callback) const noexcept
     {
@@ -658,6 +719,21 @@ public:
 
 protected:
     LeafNode m_leaf_cache;
+
+    // First element of the subtree rooted at `ref` (its leftmost leaf's
+    // element 0).
+    T subtree_first_value(ref_type ref) const
+    {
+        char* header = m_alloc.translate(ref);
+        while (NodeHeader::get_is_inner_bptree_node_from_header(header)) {
+            // the first child ref lives in slot 1 (slot 0 is offsets/epc)
+            ref = to_ref(Array::get(header, 1));
+            header = m_alloc.translate(ref);
+        }
+        LeafArray leaf(m_alloc);
+        leaf.init_from_mem(MemRef(header, ref, m_alloc));
+        return leaf.get(0);
+    }
 
     /******** Implementation of abstract interface *******/
 

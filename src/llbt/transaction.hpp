@@ -191,6 +191,9 @@ private:
     mutable _impl::History* m_history = nullptr;
 
     DB::ReadLockInfo m_read_lock;
+    // Snapshot info for the version this transaction committed. Filled by
+    // DB::low_level_commit while the write lock is held; not a tracked lock.
+    DB::ReadLockInfo m_post_commit_read_lock;
     util::Optional<DB::ReadLockInfo> m_oldest_version_not_persisted;
     std::exception_ptr m_commit_exception GUARDED_BY(m_async_mutex);
     bool m_async_commit_has_failed = false;

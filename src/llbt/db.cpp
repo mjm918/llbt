@@ -644,13 +644,14 @@ public:
         m_info->init_versioning(top_ref, file_size, initial_version);
     }
 
-    void add_version(ref_type new_top_ref, size_t new_file_size, uint64_t new_version) REQUIRES(!m_info_mutex)
+    uint32_t add_version(ref_type new_top_ref, size_t new_file_size, uint64_t new_version)
+        REQUIRES(!m_info_mutex)
     {
         std::lock_guard lock(m_mutex);
         util::CheckedLockGuard info_lock(m_info_mutex);
         ensure_reader_mapping();
         if (m_info->readers.try_allocate_entry(new_top_ref, new_file_size, new_version)) {
-            return;
+            return m_info->readers.newest.load();
         }
         // allocation failed, expand VersionList (and lockfile) and retry
         auto entries = m_info->readers.capacity();
@@ -660,6 +661,7 @@ public:
         m_info->readers.reserve(new_entries);
         auto success = m_info->readers.try_allocate_entry(new_top_ref, new_file_size, new_version);
         LLBT_ASSERT_EX(success, new_entries, new_version);
+        return m_info->readers.newest.load();
     }
 
 
@@ -1111,9 +1113,11 @@ void DB::open(const std::string& path, const DBOptions& options)
                 path, format("Architecture mismatch: Condition variable size is %1 but should be %2.",
                              info->size_of_condvar, sizeof(info->room_to_write)));
         }
-        m_writemutex.set_shared_part(info->shared_writemutex, lockfile_prefix, "write");
-        m_controlmutex.set_shared_part(info->shared_controlmutex, lockfile_prefix, "control");
-        m_versionlist_mutex.set_shared_part(info->shared_versionlist_mutex, lockfile_prefix, "versions");
+        m_writemutex.set_shared_part(info->shared_writemutex, lockfile_prefix, "write", options.single_process);
+        m_controlmutex.set_shared_part(info->shared_controlmutex, lockfile_prefix, "control",
+                                       options.single_process);
+        m_versionlist_mutex.set_shared_part(info->shared_versionlist_mutex, lockfile_prefix, "versions",
+                                            options.single_process);
 
         // even though fields match wrt alignment and size, there may still be incompatibilities
         // between implementations, so lets ask one of the mutexes if it thinks it'll work.
@@ -1539,11 +1543,13 @@ void DB::open(Replication& repl, const DBOptions& options)
     m_in_memory_info =
         std::make_unique<SharedInfo>(DBOptions::Durability::MemOnly, hist_type, repl.get_history_schema_version());
     SharedInfo* info = m_in_memory_info.get();
-    m_writemutex.set_shared_part(info->shared_writemutex, "", "write");
-    m_controlmutex.set_shared_part(info->shared_controlmutex, "", "control");
+    // An in-memory database lives in this process's anonymous memory — no
+    // other process can ever attach, so the mutexes run process-local.
+    m_writemutex.set_shared_part(info->shared_writemutex, "", "write", true);
+    m_controlmutex.set_shared_part(info->shared_controlmutex, "", "control", true);
     m_new_commit_available.set_shared_part(info->new_commit_available, "", "new_commit", options.temp_dir);
     m_pick_next_writer.set_shared_part(info->pick_next_writer, "", "pick_writer", options.temp_dir);
-    m_versionlist_mutex.set_shared_part(info->shared_versionlist_mutex, "", "versions");
+    m_versionlist_mutex.set_shared_part(info->shared_versionlist_mutex, "", "versions", true);
 
     auto target_file_format_version = uint_fast8_t(Group::get_target_file_format_version_for_session(0, hist_type));
     info->file_format_version = target_file_format_version;
@@ -1710,6 +1716,7 @@ bool DB::compact(bool bump_version_number, std::optional<const char*> output_enc
         // When someone attaches to the new database file, they *must* *not* see and
         // reuse any existing memory mapping of the stale file.
         tr->close_read_with_lock();
+        m_write_window_mgr.reset(); // window mappings reference the old file
         m_alloc.detach();
 
         util::File::move(tmp_path, m_db_path);
@@ -1979,6 +1986,7 @@ void DB::close_internal(std::unique_lock<InterprocessMutex> lock, bool allow_ope
         if (!lock.owns_lock())
             lock.lock();
 
+        m_write_window_mgr.reset(); // window mappings must go before the file
         if (m_alloc.is_attached())
             m_alloc.detach();
 
@@ -2521,12 +2529,27 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
     // Do the actual commit
     LLBT_ASSERT(oldest_version <= new_version);
 
-    GroupWriter out(transaction, Durability(info->durability), m_marker_observer.get()); // Throws
+    // The write-window cache lives on the DB so the mmap/munmap churn of
+    // setting windows up is paid once, not per commit. Only file-backed
+    // stores use windows (in-memory commits go through InMemoryWriter).
+    if (!m_write_window_mgr && Durability(info->durability) != Durability::MemOnly) {
+        m_write_window_mgr = std::make_unique<WriteWindowMgr>(m_alloc, Durability(info->durability),
+                                                              m_marker_observer.get());
+    }
+    util::ScopeExitFail clear_failed_windows([&]() noexcept {
+        if (m_write_window_mgr) {
+            m_write_window_mgr->clear_failed_mappings();
+            m_write_window_mgr.reset();
+        }
+    });
+    GroupWriter out(transaction, Durability(info->durability), m_marker_observer.get(),
+                    m_write_window_mgr.get()); // Throws
     out.set_versions(new_version, top_refs, any_new_unreachables);
     out.prepare_evacuation();
-    auto t1 = std::chrono::steady_clock::now();
     auto commit_size = m_alloc.get_commit_size();
+    std::chrono::steady_clock::time_point t1;
     if (m_logger) {
+        t1 = std::chrono::steady_clock::now();
         m_logger->log(util::LogCategory::transaction, util::Logger::Level::debug, "Initiate commit version: %1",
                       new_version);
     }
@@ -2554,7 +2577,8 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
         out.sync_according_to_durability();
         if (Durability(info->durability) == Durability::Full || Durability(info->durability) == Durability::Unsafe) {
             if (commit_to_disk) {
-                GroupCommitter cm(transaction, Durability(info->durability), m_marker_observer.get());
+                GroupCommitter cm(transaction, Durability(info->durability), m_marker_observer.get(),
+                                  m_write_window_mgr.get());
                 cm.commit(new_top_ref);
             }
         }
@@ -2569,10 +2593,18 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
         // to the database. The flag "commit_in_critical_phase" is used to prevent such updates.
         info->commit_in_critical_phase = 1;
         {
-            m_version_manager->add_version(new_top_ref, new_file_size, new_version);
+            const uint32_t reader_idx = m_version_manager->add_version(new_top_ref, new_file_size, new_version);
 
             // LLBT_ASSERT(m_alloc.matches_section_boundary(new_file_size));
             LLBT_ASSERT(new_top_ref < new_file_size);
+            // Record the committed snapshot while the write lock guarantees
+            // it stays the newest; Transaction::commit() adopts it instead of
+            // doing a grab/release round trip through the version list.
+            transaction.m_post_commit_read_lock.m_type = ReadLockInfo::Live;
+            transaction.m_post_commit_read_lock.m_version = new_version;
+            transaction.m_post_commit_read_lock.m_reader_idx = reader_idx;
+            transaction.m_post_commit_read_lock.m_top_ref = new_top_ref;
+            transaction.m_post_commit_read_lock.m_file_size = new_file_size;
         }
         // At this point, the VersionList has been succesfully updated, and the next writer
         // can safely proceed once the writemutex has been lifted.
@@ -2588,8 +2620,8 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
 
         m_new_commit_available.notify_all();
     }
-    auto t2 = std::chrono::steady_clock::now();
     if (m_logger) {
+        auto t2 = std::chrono::steady_clock::now();
         std::string to_disk_str = commit_to_disk ? util::format(" ref %1", new_top_ref) : " (no commit to disk)";
         m_logger->log(util::LogCategory::transaction, util::Logger::Level::debug, "Commit of size %1 done in %2 us%3",
                       commit_size, std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),

@@ -23,8 +23,9 @@
 #include <llbt/util/thread.hpp>
 #include <llbt/util/file.hpp>
 #include <llbt/utilities.hpp>
-#include <mutex>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <thread>
 
 #if LLBT_PLATFORM_APPLE
@@ -91,7 +92,16 @@ public:
     /// You need to bind the emulation to a SharedPart in shared/mmapped memory.
     /// The SharedPart is assumed to have been initialized (possibly by another process)
     /// elsewhere.
-    void set_shared_part(SharedPart& shared_part, const std::string& path, const std::string& mutex_name);
+    ///
+    /// With `in_process_only` the caller promises that no other process will
+    /// use this mutex (e.g. an in-memory store, or a file the application
+    /// opens from a single process). Where the robust-mutex emulation would
+    /// pay a file-lock syscall per lock/unlock, the mutex then runs on a
+    /// process-wide semaphore instead — shared between all InterprocessMutex
+    /// instances bound to the same underlying file, so multiple DB objects
+    /// in one process still exclude each other.
+    void set_shared_part(SharedPart& shared_part, const std::string& path, const std::string& mutex_name,
+                         bool in_process_only = false);
 
     /// Destroy shared object. Potentially release system resources. Caller must
     /// ensure that the shared_part is not in use at the point of call.
@@ -130,10 +140,17 @@ private:
 #if LLBT_ROBUST_MUTEX_EMULATION
     File m_file;
 #if LLBT_PLATFORM_APPLE
-    SemaphoreMutex m_local_mutex;
+    using LocalMutex = SemaphoreMutex;
 #else
-    Mutex m_local_mutex;
+    using LocalMutex = Mutex;
 #endif
+    LocalMutex m_local_mutex;
+    // Every instance for the same lock file shares this process-wide mutex.
+    // Cross-process mode takes the file lock as well; single-process mode can
+    // skip it without splitting same-process users into two lock domains.
+    std::shared_ptr<LocalMutex> m_shared_in_process;
+    bool m_use_file_lock = true;
+    static std::shared_ptr<LocalMutex> shared_in_process_mutex(const File::UniqueID& uid);
 
 #else
     SharedPart* m_shared_part = nullptr;
@@ -156,8 +173,26 @@ inline InterprocessMutex::~InterprocessMutex() noexcept
 #endif
 }
 
+#if LLBT_ROBUST_MUTEX_EMULATION
+inline std::shared_ptr<InterprocessMutex::LocalMutex>
+InterprocessMutex::shared_in_process_mutex(const File::UniqueID& uid)
+{
+    // One process-wide mutex per underlying lock file, so every
+    // InterprocessMutex bound to the same file shares it.
+    static std::mutex s_registry_mutex;
+    static std::map<File::UniqueID, std::weak_ptr<LocalMutex>> s_registry;
+    std::lock_guard<std::mutex> lg(s_registry_mutex);
+    auto& slot = s_registry[uid];
+    if (auto existing = slot.lock())
+        return existing;
+    auto fresh = std::make_shared<LocalMutex>();
+    slot = fresh;
+    return fresh;
+}
+#endif
+
 inline void InterprocessMutex::set_shared_part(SharedPart& shared_part, const std::string& path,
-                                               const std::string& mutex_name)
+                                               const std::string& mutex_name, bool in_process_only)
 {
 #if LLBT_ROBUST_MUTEX_EMULATION
     static_cast<void>(shared_part);
@@ -178,8 +213,11 @@ inline void InterprocessMutex::set_shared_part(SharedPart& shared_part, const st
     m_file.open(filename, File::mode_Append);
     // exFAT does not allocate a unique id for the file until it's non-empty
     m_file.resize(1);
+    m_shared_in_process = shared_in_process_mutex(File::get_unique_id(m_file.get_descriptor(), filename));
+    m_use_file_lock = !in_process_only;
 
 #elif defined(_WIN32)
+    static_cast<void>(in_process_only);
     if (m_handle) {
         bool b = CloseHandle(m_handle);
         LLBT_ASSERT_RELEASE(b);
@@ -204,6 +242,8 @@ inline void InterprocessMutex::set_shared_part(SharedPart& shared_part, const st
 inline void InterprocessMutex::release_shared_part()
 {
 #if LLBT_ROBUST_MUTEX_EMULATION
+    m_shared_in_process.reset();
+    m_use_file_lock = true;
     if (m_file.is_attached()) {
         m_file.close();
         File::try_remove(m_file.get_path());
@@ -217,7 +257,16 @@ inline void InterprocessMutex::lock()
 {
 #if LLBT_ROBUST_MUTEX_EMULATION
     std::unique_lock mutex_lock(m_local_mutex);
-    m_file.lock();
+    m_shared_in_process->lock();
+    if (m_use_file_lock) {
+        try {
+            m_file.lock();
+        }
+        catch (...) {
+            m_shared_in_process->unlock();
+            throw;
+        }
+    }
     mutex_lock.release();
 #else
 
@@ -238,8 +287,20 @@ inline bool InterprocessMutex::try_lock()
     if (!mutex_lock.owns_lock()) {
         return false;
     }
-    if (!m_file.try_lock()) {
+    if (!m_shared_in_process->try_lock()) {
         return false;
+    }
+    if (m_use_file_lock) {
+        try {
+            if (!m_file.try_lock()) {
+                m_shared_in_process->unlock();
+                return false;
+            }
+        }
+        catch (...) {
+            m_shared_in_process->unlock();
+            throw;
+        }
     }
     mutex_lock.release();
     return true;
@@ -263,7 +324,9 @@ inline bool InterprocessMutex::try_lock()
 inline void InterprocessMutex::unlock()
 {
 #if LLBT_ROBUST_MUTEX_EMULATION
-    m_file.unlock();
+    if (m_use_file_lock)
+        m_file.unlock();
+    m_shared_in_process->unlock();
     m_local_mutex.unlock();
 #else
 #ifdef _WIN32

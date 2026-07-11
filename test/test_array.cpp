@@ -21,6 +21,7 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 #include <map>
@@ -561,6 +562,21 @@ TEST(Array_Unsigned)
     CHECK_EQUAL(c.upper_bound(1), 1);
     CHECK_EQUAL(c.upper_bound(2), 3);
     CHECK_EQUAL(c.upper_bound(3), 4);
+
+    // A negative adjustment keeps the old unsigned wrap semantics. If it
+    // underflows, the array must widen rather than truncate to its old width.
+    c.truncate(0);
+    c.add(0);
+    c.adjust(0, 1, -1);
+    CHECK_EQUAL(c.get(0), std::numeric_limits<uint64_t>::max());
+    CHECK_EQUAL(c.get_width(), 64);
+
+    c.truncate(0);
+    for (uint64_t i = 0; i < 4; ++i)
+        c.add(i);
+    c.adjust(3, 1, 1); // reversed range remains a no-op
+    for (uint64_t i = 0; i < 4; ++i)
+        CHECK_EQUAL(c.get(i), i);
 
     c.destroy();
 }

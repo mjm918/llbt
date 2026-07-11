@@ -20,6 +20,7 @@
 #define LLBT_GROUP_WRITER_HPP
 
 #include <cstdint> // unint8_t etc
+#include <memory>
 #include <utility>
 #include <map>
 
@@ -64,11 +65,16 @@ class WriteWindowMgr {
 public:
     using Durability = DBOptions::Durability;
     WriteWindowMgr(SlabAlloc& alloc, Durability dura, util::WriteMarker* write_marker);
+    ~WriteWindowMgr(); // out of line: MapWindow is complete only in the .cpp
     // Flush all cached memory mappings
     // Sync all cached memory mappings to disk - includes flush if needed
     void sync_all_mappings();
     // Flush all cached memory mappings from private to shared cache.
     void flush_all_mappings();
+    // Drop mappings after a failed commit while the write lock is still held.
+    // Encrypted mappings flush their private dirty pages during unmap; keeping
+    // them cached past rollback could write stale data after another commit.
+    void clear_failed_mappings() noexcept;
     class MapWindow;
     // Get a suitable memory mapping for later access:
     // potentially adding it to the cache, potentially closing
@@ -78,6 +84,14 @@ public:
 protected:
     SlabAlloc& m_alloc;
     Durability m_durability;
+    // File size as last observed. The file only grows while a write is in
+    // progress, so it is refreshed (fstat) only when a window request
+    // reaches beyond the cached value.
+    size_t m_cached_file_size = 0;
+    size_t known_file_size(size_t required_size);
+    // Full durability syncs before remapping an existing window. Unsafe mode
+    // only flushes encrypted pages there; LRU eviction is synced separately.
+    bool needs_sync_on_unmap() const;
     // Currently cached memory mappings. We keep as many as 16 1MB windows
     // open for writing. The allocator will favor sequential allocation
     // from a modest number of windows, depending upon fragmentation, so
@@ -94,7 +108,11 @@ class GroupCommitter {
 public:
     using Durability = DBOptions::Durability;
     using MapWindow = WriteWindowMgr::MapWindow;
-    GroupCommitter(Transaction&, Durability dura = Durability::Full, util::WriteMarker* write_marker = nullptr);
+    /// `shared_window_mgr` lets the caller keep one WriteWindowMgr alive
+    /// across commits (saves mmap/munmap churn per commit); without it a
+    /// private one is created for this commit only.
+    GroupCommitter(Transaction&, Durability dura = Durability::Full, util::WriteMarker* write_marker = nullptr,
+                   WriteWindowMgr* shared_window_mgr = nullptr);
     ~GroupCommitter();
     /// Flush changes to physical medium, then write the new top ref
     /// to the file header, then flush again. Pass the top ref
@@ -105,7 +123,8 @@ protected:
     Transaction& m_group;
     SlabAlloc& m_alloc;
     Durability m_durability;
-    WriteWindowMgr m_window_mgr;
+    std::unique_ptr<WriteWindowMgr> m_owned_window_mgr;
+    WriteWindowMgr& m_window_mgr;
 };
 
 /// This class is not supposed to be reused for multiple write sessions. In
@@ -124,7 +143,12 @@ public:
     // (Group::m_is_shared), the constructor also adds version tracking
     // information to the group, if it is not already present (6th and 7th entry
     // in Group::m_top).
-    GroupWriter(Transaction&, Durability dura = Durability::Full, util::WriteMarker* write_marker = nullptr);
+    //
+    // `shared_window_mgr` lets the caller keep one WriteWindowMgr alive
+    // across commits (saves mmap/munmap churn per commit); without it a
+    // private one is created for this commit only.
+    GroupWriter(Transaction&, Durability dura = Durability::Full, util::WriteMarker* write_marker = nullptr,
+                WriteWindowMgr* shared_window_mgr = nullptr);
     ~GroupWriter();
 
     void set_versions(uint64_t current, TopRefMap& top_refs, bool any_num_unreachables) noexcept;
@@ -219,7 +243,8 @@ private:
     Transaction& m_group;
     SlabAlloc& m_alloc;
     Durability m_durability;
-    WriteWindowMgr m_window_mgr;
+    std::unique_ptr<WriteWindowMgr> m_owned_window_mgr;
+    WriteWindowMgr& m_window_mgr;
     Array m_free_positions; // 4th slot in Group::m_top
     Array m_free_lengths;   // 5th slot in Group::m_top
     Array m_free_versions;  // 6th slot in Group::m_top

@@ -31,7 +31,7 @@ struct DBOptions {
     enum class Durability : uint16_t {
         Full,
         MemOnly,
-        Unsafe // If you use this, you loose ACID property
+        Unsafe // No crash-consistency or durability guarantee
     };
 
     explicit DBOptions(Durability level = Durability::Full, const char* key = nullptr)
@@ -105,6 +105,15 @@ struct DBOptions {
     /// If set, opening a file which is not a Barq file or cannot be decrypted
     /// will clear and reinitialize the file.
     bool clear_on_invalid_file = false;
+
+    /// Promise that this file is only ever opened from one process at a time.
+    /// On platforms where the robust-mutex emulation locks a file per
+    /// mutex operation (Apple, Android), the per-commit lock traffic then
+    /// runs on process-local mutexes instead — considerably faster. Multiple
+    /// DB objects within the process still exclude each other correctly.
+    /// Opening the same file from a second process while this is set is
+    /// undefined behavior. In-memory databases always run in this mode.
+    bool single_process = false;
 
     /// sys_tmp_dir will be used if the temp_dir is empty when creating DBOptions.
     /// It must be writable and allowed to create pipe/fifo file on it.
