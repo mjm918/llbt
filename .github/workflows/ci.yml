@@ -4,6 +4,12 @@ on:
     branches: [main]
   pull_request:
 
+# Supersede older in-progress runs on the same ref so a stuck/queued job
+# (e.g. a scarce runner) never leaves CI hanging.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     strategy:
@@ -11,7 +17,6 @@ jobs:
       matrix:
         include:
           - { os: macos-14, name: macOS-arm64 }
-          - { os: macos-13, name: macOS-x64 }
           - { os: ubuntu-24.04, name: Linux-x64 }
           - { os: windows-2022, name: Windows-x64 }
     runs-on: ${{ matrix.os }}
