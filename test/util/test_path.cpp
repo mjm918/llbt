@@ -126,12 +126,15 @@ bool initialize_test_path(int argc, const char* argv[])
     // that as the base path.
 #elif defined(_MSC_VER)
     wchar_t path[MAX_PATH];
-    if (GetModuleFileName(NULL, path, MAX_PATH) == 0) {
+    // Use the wide variants explicitly: the buffer is wchar_t and
+    // PathCchRemoveFileSpec below is wide-only. Without UNICODE defined the
+    // generic macros would resolve to the narrow ...A calls and fail to compile.
+    if (GetModuleFileNameW(NULL, path, MAX_PATH) == 0) {
         fprintf(stderr, "Failed to retrieve path to exectuable.\n");
         return false;
     }
     PathCchRemoveFileSpec(path, MAX_PATH);
-    SetCurrentDirectory(path);
+    SetCurrentDirectoryW(path);
     g_path_prefix = std::string(reinterpret_cast<const char*>(std::filesystem::path(path).u8string().c_str()));
     g_resource_path = g_path_prefix + "\\resources\\";
 #else
