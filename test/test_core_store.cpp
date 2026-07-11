@@ -330,21 +330,28 @@ TEST(CoreStore_ReplacedRootsDoNotLeak)
     // Warm up: let the file reach its steady working size.
     for (int64_t g = 0; g < 3; ++g)
         write_generation(g * 1000);
-    util::File f(store->path());
-    auto steady_size = f.get_size();
+    // Read the on-disk size through a fresh, immediately-closed handle. On
+    // Windows compact() replaces the file and cannot proceed while any other
+    // handle to it is open, so we must not hold one across the call (POSIX is
+    // lenient about this, which is why it only bites on Windows).
+    auto file_size = [&] {
+        util::File f(store->path());
+        return f.get_size();
+    };
+    auto steady_size = file_size();
 
     // 20 more full rewrites of the same live payload. If replaced trees were
     // not freed back to the free list, the file would grow ~linearly with
     // generations; with correct freeing it plateaus.
     for (int64_t g = 3; g <= 23; ++g)
         write_generation(g * 1000);
-    auto size_after_many = f.get_size();
+    auto size_after_many = file_size();
     CHECK_LESS_EQUAL(size_after_many, steady_size * 2);
 
     // And a compacted file with identical live data stays the same size
     // no matter how many generations preceded it.
     store->compact();
-    auto compacted = f.get_size();
+    auto compacted = file_size();
     CHECK_LESS_EQUAL(compacted, steady_size);
 }
 
