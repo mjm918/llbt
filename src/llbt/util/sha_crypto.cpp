@@ -20,6 +20,13 @@
 #include <llbt/util/backtrace.hpp>
 #include <llbt/util/assert.hpp>
 
+// SHA-1/SHA-256 here are used only by the optional file-encryption layer
+// (encrypted_file_mapping.cpp includes this header under the same guard).
+// With encryption disabled there is no caller and no platform crypto backend
+// to bind to — off Apple that otherwise needs bundled sha headers that are not
+// vendored — so compile the whole translation unit to nothing.
+#if LLBT_ENABLE_ENCRYPTION
+
 #if LLBT_PLATFORM_APPLE
 #include <CommonCrypto/CommonCrypto.h>
 #elif defined(_WIN32)
@@ -260,3 +267,5 @@ void hmac_sha256(Span<const uint8_t> in_buffer, Span<uint8_t, 32> out_buffer, Sp
 
 } // namespace util
 } // namespace llbt
+
+#endif // LLBT_ENABLE_ENCRYPTION
