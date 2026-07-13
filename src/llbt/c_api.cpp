@@ -11,6 +11,7 @@
 ** This applies only to files authored by the llbt project. The imported
 ** storage engine underneath keeps its own copyright and the Apache License
 ** 2.0; see LICENSE and NOTICE.
+** Copyright (c) 2026 Mohammad Julfikar
 */
 
 // C facade over llbt::core. Every fallible entry point runs its body inside a
@@ -304,6 +305,37 @@ extern "C" llbt_status llbt_store_open(const char* path, const llbt_options* opt
     }
 }
 
+extern "C" llbt_status llbt_store_open_ex(const char* path, const llbt_open_options* opts, llbt_store** out)
+{
+    if (!path || !out)
+        return fail(LLBT_E_INVALID_ARG, "null argument");
+    if (opts && opts->struct_size < sizeof(llbt_open_options))
+        return fail(LLBT_E_INVALID_ARG, "llbt_open_options.struct_size is too small");
+    *out = nullptr;
+    try {
+        llbt::core::Options o;
+        if (opts) {
+            o.encryption_key = opts->encryption_key;
+            o.single_process = opts->single_process != 0;
+            o.allow_file_format_upgrade = opts->allow_file_format_upgrade != 0;
+            switch (opts->durability) {
+                case LLBT_DURABILITY_STRICT: o.durability = llbt::core::Durability::Strict; break;
+                case LLBT_DURABILITY_ORDERED: o.durability = llbt::core::Durability::Ordered; break;
+                case LLBT_DURABILITY_UNSAFE: o.durability = llbt::core::Durability::Unsafe; break;
+                default: return fail(LLBT_E_INVALID_ARG, "invalid durability");
+            }
+        }
+        StoreRef ref = Store::open(path, o);
+        auto* s = new llbt_store{std::move(ref), std::string()};
+        s->path = s->ref->path();
+        *out = s;
+        return ok();
+    }
+    catch (...) {
+        return current_exception_to_status();
+    }
+}
+
 extern "C" llbt_status llbt_store_open_in_memory(llbt_store** out)
 {
     if (!out)
@@ -334,6 +366,19 @@ extern "C" llbt_status llbt_store_compact(llbt_store* store, int* out_compacted)
         bool did = store->ref->compact();
         if (out_compacted)
             *out_compacted = did ? 1 : 0;
+        return ok();
+    }
+    catch (...) {
+        return current_exception_to_status();
+    }
+}
+
+extern "C" llbt_status llbt_store_reserve(llbt_store* store, size_t bytes)
+{
+    if (!store)
+        return fail(LLBT_E_INVALID_ARG, "null store");
+    try {
+        store->ref->reserve(bytes);
         return ok();
     }
     catch (...) {
@@ -583,6 +628,29 @@ extern "C" llbt_status llbt_tree_add(llbt_tree* tree, const llbt_value* v)
     }
 }
 
+extern "C" llbt_status llbt_tree_add_range(llbt_tree* tree, const llbt_value* values, size_t count)
+{
+    if (!tree || (count && !values))
+        return fail(LLBT_E_INVALID_ARG, "null argument");
+    try {
+        return std::visit(
+            [&](auto& t) -> llbt_status {
+                using U = typename elem_of<std::decay_t<decltype(t)>>::type;
+                std::vector<U> converted(count);
+                for (size_t i = 0; i < count; ++i) {
+                    if (!val_in(&values[i], converted[i]))
+                        return fail(LLBT_E_TYPE_MISMATCH, "value type does not match tree");
+                }
+                t.add_range(converted.data(), converted.size());
+                return ok();
+            },
+            tree->v);
+    }
+    catch (...) {
+        return current_exception_to_status();
+    }
+}
+
 extern "C" llbt_status llbt_tree_insert(llbt_tree* tree, size_t index, const llbt_value* v)
 {
     if (!tree || !v)
@@ -629,6 +697,30 @@ extern "C" llbt_status llbt_tree_set(llbt_tree* tree, size_t index, const llbt_v
     }
 }
 
+extern "C" llbt_status llbt_tree_set_many(llbt_tree* tree, const size_t* positions,
+                                             const llbt_value* values, size_t count)
+{
+    if (!tree || (count && (!positions || !values)))
+        return fail(LLBT_E_INVALID_ARG, "null argument");
+    try {
+        return std::visit(
+            [&](auto& t) -> llbt_status {
+                using U = typename elem_of<std::decay_t<decltype(t)>>::type;
+                std::vector<U> converted(count);
+                for (size_t i = 0; i < count; ++i) {
+                    if (!val_in(&values[i], converted[i]))
+                        return fail(LLBT_E_TYPE_MISMATCH, "value type does not match tree");
+                }
+                t.set_many(positions, converted.data(), count);
+                return ok();
+            },
+            tree->v);
+    }
+    catch (...) {
+        return current_exception_to_status();
+    }
+}
+
 extern "C" llbt_status llbt_tree_get(llbt_tree* tree, size_t index, llbt_value* out)
 {
     if (!tree || !out)
@@ -658,6 +750,23 @@ extern "C" llbt_status llbt_tree_erase(llbt_tree* tree, size_t index)
                 if (index >= t.size())
                     return fail(LLBT_E_OUT_OF_BOUNDS, "index out of bounds");
                 t.erase(index);
+                return ok();
+            },
+            tree->v);
+    }
+    catch (...) {
+        return current_exception_to_status();
+    }
+}
+
+extern "C" llbt_status llbt_tree_erase_many(llbt_tree* tree, const size_t* positions, size_t count)
+{
+    if (!tree || (count && !positions))
+        return fail(LLBT_E_INVALID_ARG, "null argument");
+    try {
+        return std::visit(
+            [&](auto& t) -> llbt_status {
+                t.erase_many(positions, count);
                 return ok();
             },
             tree->v);

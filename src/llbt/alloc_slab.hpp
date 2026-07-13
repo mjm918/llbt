@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_ALLOC_SLAB_HPP
@@ -193,6 +194,8 @@ public:
     /// Reads file format from file header. Must be called from within a write
     /// transaction.
     int get_committed_file_format_version() noexcept;
+    /// Reads the selected checkpoint top reference from the file header.
+    ref_type get_committed_top_ref() noexcept;
 
     bool is_file_on_streaming_form() const
     {
@@ -258,9 +261,6 @@ public:
     /// attached to a file. Doing so will result in undefined behavior.
     void resize_file(size_t new_file_size);
 
-#ifdef LLBT_DEBUG
-    /// Deprecated method, only called from a unit test
-    ///
     /// WARNING: This method is NOT thread safe on multiple platforms; see
     /// File::prealloc().
     ///
@@ -282,7 +282,6 @@ public:
     /// It is an error to call this function on an allocator that is not
     /// attached to a file. Doing so will result in undefined behavior.
     void reserve_disk_space(size_t size_in_bytes);
-#endif
 
     /// Get the size of the attached database file or buffer in number
     /// of bytes. This size is not affected by new allocations. After

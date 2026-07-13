@@ -11,12 +11,15 @@
 ** This applies only to files authored by the llbt project. The imported
 ** storage engine underneath keeps its own copyright and the Apache License
 ** 2.0; see LICENSE and NOTICE.
+** Copyright (c) 2026 Mohammad Julfikar
 */
 #include "testsettings.hpp"
 #ifdef TEST_CORE_STORE
 
 #include <llbt/core.hpp>
 #include <llbt/array_binary.hpp>
+#include <llbt/db.hpp>
+#include <llbt/group.hpp>
 #include <llbt/impl/simulated_failure.hpp>
 
 #include "test.hpp"
@@ -73,6 +76,178 @@ TEST(CoreStore_TreeDurabilityAcrossReopen)
         CHECK_EQUAL(t.get(1), -2);
         CHECK_EQUAL(t.size(), 10000);
     }
+}
+
+TEST(CoreStore_Format24UpgradeAndUpgradeDisabled)
+{
+    TEST_PATH(path);
+    Options fast;
+    fast.durability = Durability::Unsafe;
+    _impl::GroupFriend::fake_target_file_format(24);
+    try {
+        StoreRef legacy = Store::open(path, fast);
+        legacy->write([](Tx& tx) {
+            tx.tree<int64_t>("legacy").add(24);
+        });
+    }
+    catch (...) {
+        _impl::GroupFriend::fake_target_file_format(std::nullopt);
+        throw;
+    }
+    _impl::GroupFriend::fake_target_file_format(std::nullopt);
+
+    Options prohibited = fast;
+    prohibited.allow_file_format_upgrade = false;
+    CHECK_THROW(Store::open(path, prohibited), FileFormatUpgradeRequired);
+
+    StoreRef upgraded = Store::open(path, fast);
+    CHECK_EQUAL(upgraded->begin_read().tree<int64_t>("legacy").get(0), 24);
+    upgraded->write([](Tx& tx) {
+        tx.tree<int64_t>("legacy").add(25);
+    });
+    upgraded.reset();
+    CHECK_EQUAL(Store::open(path, fast)->begin_read().tree<int64_t>("legacy").size(), 2);
+}
+
+TEST(CoreStore_CommitMetricsCoverWriteWork)
+{
+    TEST_PATH(path);
+    Options options;
+    options.durability = Durability::Unsafe;
+    StoreRef store = Store::open(path, options);
+    std::string bytes(1024, 'm');
+    std::vector<BinaryData> values(128, BinaryData(bytes));
+    store->write([&](Tx& tx) {
+        tx.tree<BinaryData>("metrics").add_range(values.data(), values.size());
+    });
+    CommitMetrics metrics = store->last_commit_metrics();
+    CHECK_GREATER(metrics.arrays_written, 0);
+    CHECK_GREATER(metrics.cow_bytes_written, 0);
+    CHECK_GREATER(metrics.binary_payload_bytes, 0);
+    CHECK_GREATER(metrics.mapping_windows_touched, 0);
+    CHECK_GREATER_EQUAL(metrics.file_size_after, metrics.file_size_before);
+    CHECK_EQUAL(metrics.physical_file_growth,
+                int64_t(metrics.file_size_after) - int64_t(metrics.file_size_before));
+    CHECK_GREATER_EQUAL(metrics.total_us, metrics.tree_write_us + metrics.free_list_us);
+}
+
+TEST(CoreStore_BulkBinaryAppendUpdateAndReopen)
+{
+    TEST_PATH(path);
+    Options options;
+    options.durability = Durability::Unsafe;
+    StoreRef store = Store::open(path, options);
+    std::vector<std::string> storage(2500);
+    std::vector<BinaryData> values;
+    values.reserve(storage.size());
+    for (size_t i = 0; i < storage.size(); ++i) {
+        storage[i] = std::to_string(i) + std::string(1024, 'a');
+        values.emplace_back(storage[i]);
+    }
+    store->write([&](Tx& tx) {
+        tx.tree<BinaryData>("binary").add_range(values.data(), values.size());
+    });
+
+    const size_t positions[] = {0, 999, 1000, 2499};
+    std::vector<std::string> replacement_storage(4, std::string(1030, 'z'));
+    std::vector<BinaryData> replacements;
+    for (const std::string& value : replacement_storage)
+        replacements.emplace_back(value);
+    store->write([&](Tx& tx) {
+        tx.tree<BinaryData>("binary").set_many(positions, replacements.data(), 4);
+    });
+    store.reset();
+
+    StoreRef reopened = Store::open(path, options);
+    Tree<BinaryData> binary = reopened->begin_read().tree<BinaryData>("binary");
+    CHECK_EQUAL(binary.size(), size_t(2500));
+    for (size_t position : positions)
+        CHECK_EQUAL(binary.get(position), replacements[0]);
+}
+
+TEST(CoreStore_StrictOrderedAndUnsafeDurability)
+{
+    TEST_PATH(base_path);
+    const Durability modes[] = {Durability::Strict, Durability::Ordered, Durability::Unsafe};
+    for (size_t i = 0; i < 3; ++i) {
+        std::string path = std::string(base_path) + std::to_string(i);
+        Options options;
+        options.durability = modes[i];
+        {
+            StoreRef store = Store::open(path, options);
+            store->write([&](Tx& tx) {
+                tx.tree<int64_t>("mode").add(int64_t(i));
+            });
+            if (modes[i] == Durability::Unsafe)
+                CHECK_EQUAL(store->last_commit_metrics().first_sync_us, uint64_t(0));
+        }
+        StoreRef reopened = Store::open(path, options);
+        CHECK_EQUAL(reopened->begin_read().tree<int64_t>("mode").get(0), int64_t(i));
+    }
+}
+
+TEST_IF(CoreStore_JournalFaultRecovery, _impl::SimulatedFailure::is_enabled())
+{
+    TEST_PATH(path);
+    Options options;
+    options.durability = Durability::Strict;
+    StoreRef store = Store::open(path, options);
+    store->write([](Tx& tx) {
+        tx.tree<int64_t>("values").add(1);
+    });
+
+    {
+        Tx tx = store->begin_write();
+        tx.tree<int64_t>("values").add(2);
+        _impl::SimulatedFailure::OneShotPrimeGuard fail(
+            _impl::SimulatedFailure::commit_journal__partial_record);
+        CHECK_THROW_ANY(tx.commit());
+        tx.rollback();
+    }
+    store.reset();
+    store = Store::open(path, options);
+    CHECK_EQUAL(store->begin_read().tree<int64_t>("values").size(), 1);
+
+    {
+        Tx tx = store->begin_write();
+        tx.tree<int64_t>("values").add(3);
+        _impl::SimulatedFailure::OneShotPrimeGuard fail(
+            _impl::SimulatedFailure::commit_journal__after_sync);
+        CHECK_THROW_ANY(tx.commit());
+        tx.rollback();
+    }
+    store.reset();
+    store = Store::open(path, options);
+    Tree<int64_t> recovered = store->begin_read().tree<int64_t>("values");
+    CHECK_EQUAL(recovered.size(), 2);
+    CHECK_EQUAL(recovered.get(1), 3);
+}
+
+TEST(CoreStore_PublicBulkOperations)
+{
+    TEST_PATH(path);
+    StoreRef store = Store::open(path, {.single_process = true});
+    Tx tx = store->begin_write();
+    Tree<int64_t> tree = tx.tree<int64_t>("bulk");
+    std::vector<int64_t> first(1001);
+    std::vector<int64_t> second(2500);
+    for (size_t i = 0; i < first.size(); ++i)
+        first[i] = int64_t(i);
+    for (size_t i = 0; i < second.size(); ++i)
+        second[i] = int64_t(first.size() + i);
+    tree.add_range(first.data(), first.size());
+    tree.add_range(second.data(), second.size());
+    const size_t positions[] = {0, 1000, 1001, 3500};
+    const int64_t replacements[] = {-1, -2, -3, -4};
+    tree.set_many(positions, replacements, 4);
+    tree.erase_many(positions, 4);
+    CHECK_EQUAL(tree.size(), 3497);
+    tx.commit();
+
+    Tx read = store->begin_read();
+    Tree<int64_t> saved = read.tree<int64_t>("bulk");
+    CHECK_EQUAL(saved.size(), 3497);
+    CHECK_EQUAL(saved.get(0), 1);
 }
 
 TEST(CoreStore_NamedRootsDirectory)
@@ -360,6 +535,14 @@ TEST(CoreStore_ReplacedRootsDoNotLeak)
     store->compact();
     auto compacted = file_size();
     CHECK_LESS_EQUAL(compacted, steady_size);
+    store->write([](Tx& tx) {
+        tx.tree<int64_t>("gen").add(999999);
+    });
+    store.reset();
+    StoreRef reopened = Store::open(path);
+    Tree<int64_t> after_compact = reopened->begin_read().tree<int64_t>("gen");
+    CHECK_EQUAL(after_compact.size(), size_t(5001));
+    CHECK_EQUAL(after_compact.get(5000), int64_t(999999));
 }
 
 // In-memory store: the same engine with no backing file. Everything works

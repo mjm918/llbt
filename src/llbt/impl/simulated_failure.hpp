@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_IMPL_SIMULATED_FAILURE_HPP
@@ -37,6 +38,10 @@ public:
     enum FailureType {
         generic,
         group_writer__commit,
+        commit_journal__partial_record,
+        commit_journal__before_sync,
+        commit_journal__after_sync,
+        commit_journal__checkpoint,
         slab_alloc__reset_free_space_tracking,
         slab_alloc__remap,
         shared_group__grow_reader_mapping,

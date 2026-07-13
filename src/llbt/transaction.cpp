@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <llbt/transaction.hpp>
@@ -291,7 +292,10 @@ void Transaction::upgrade_file_format(int target_file_format_version)
     if (fake_target_file_format && *fake_target_file_format == target_file_format_version) {
         return; // Testing, mockup scenario, not a real upgrade. Just pretend we're done!
     }
-    if (get_file_format_version() != target_file_format_version) {
+    int current = get_file_format_version();
+    if (current == 24 && target_file_format_version == 25)
+        return;
+    if (current != target_file_format_version) {
         throw FileAccessError(ErrorCodes::FileFormatUpgradeRequired,
                               "llbt cannot upgrade files created by the table-era format", db->get_path());
     }

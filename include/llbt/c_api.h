@@ -11,6 +11,7 @@
 ** This applies only to files authored by the llbt project. The imported
 ** storage engine underneath keeps its own copyright and the Apache License
 ** 2.0; see LICENSE and NOTICE.
+** Copyright (c) 2026 Mohammad Julfikar
 */
 #ifndef LLBT_C_API_H
 #define LLBT_C_API_H
@@ -151,6 +152,22 @@ typedef struct llbt_options {
     int single_process;         /* if non-zero, promise single-process access (faster) */
 } llbt_options;
 
+typedef enum llbt_durability {
+    LLBT_DURABILITY_STRICT = 0,
+    LLBT_DURABILITY_ORDERED = 1,
+    LLBT_DURABILITY_UNSAFE = 2
+} llbt_durability;
+
+/* Extensible options for llbt_store_open_ex(). Set struct_size to
+ * sizeof(llbt_open_options). Unknown trailing fields are ignored. */
+typedef struct llbt_open_options {
+    size_t struct_size;
+    const char* encryption_key;
+    llbt_durability durability;
+    int single_process;
+    int allow_file_format_upgrade;
+} llbt_open_options;
+
 /* ----------------------------------------------------------------- library */
 
 /* Version string, e.g. "3.0.0". Never NULL, statically owned. */
@@ -165,6 +182,8 @@ const char* llbt_last_error(void);
 
 /* Open (creating if needed) a store backed by `path`. `opts` may be NULL. */
 llbt_status llbt_store_open(const char* path, const llbt_options* opts, llbt_store** out);
+/* Open with an explicit durability level. `opts` may be NULL. */
+llbt_status llbt_store_open_ex(const char* path, const llbt_open_options* opts, llbt_store** out);
 /* Open an ephemeral in-memory store (nothing touches disk). */
 llbt_status llbt_store_open_in_memory(llbt_store** out);
 /* Release the store handle. Any open transactions/trees from it become
@@ -173,6 +192,8 @@ void llbt_store_close(llbt_store* store);
 /* Rewrite the file to its minimal size (needs no live transactions).
  * `out_compacted` (nullable) is set to 1 if it ran, 0 for an in-memory store. */
 llbt_status llbt_store_compact(llbt_store* store, int* out_compacted);
+/* Preallocate backing-file space without changing the logical database size. */
+llbt_status llbt_store_reserve(llbt_store* store, size_t bytes);
 /* Backing path, or "<llbt in-memory>". Valid for the store's lifetime. */
 const char* llbt_store_path(llbt_store* store);
 /* Non-zero if the store has no backing file. */
@@ -238,15 +259,22 @@ int llbt_tree_is_empty(llbt_tree* tree);
 
 /* Append `v` (write txn). `v->type` must match the tree's type. */
 llbt_status llbt_tree_add(llbt_tree* tree, const llbt_value* v);
+/* Append `count` values atomically. */
+llbt_status llbt_tree_add_range(llbt_tree* tree, const llbt_value* values, size_t count);
 /* Insert `v` at `index` (0..size). */
 llbt_status llbt_tree_insert(llbt_tree* tree, size_t index, const llbt_value* v);
 /* Overwrite element `index`. */
 llbt_status llbt_tree_set(llbt_tree* tree, size_t index, const llbt_value* v);
+/* Set sorted, unique positions atomically. */
+llbt_status llbt_tree_set_many(llbt_tree* tree, const size_t* positions,
+                               const llbt_value* values, size_t count);
 /* Read element `index` into `*out`. For STRING/BINARY, `out->as.bytes.data`
  * points into the transaction's memory (see the lifetime note up top). */
 llbt_status llbt_tree_get(llbt_tree* tree, size_t index, llbt_value* out);
 /* Erase element `index`. */
 llbt_status llbt_tree_erase(llbt_tree* tree, size_t index);
+/* Erase sorted, unique positions. Positions refer to the original tree. */
+llbt_status llbt_tree_erase_many(llbt_tree* tree, const size_t* positions, size_t count);
 /* Remove all elements. */
 llbt_status llbt_tree_clear(llbt_tree* tree);
 /* Index of the first element equal to `v`, or LLBT_NPOS. */

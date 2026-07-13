@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_ARRAY_BINARY_HPP
@@ -21,6 +22,7 @@
 
 #include <llbt/array_blobs_small.hpp>
 #include <llbt/array_blobs_big.hpp>
+#include <llbt/array_packed_blobs.hpp>
 
 namespace llbt {
 
@@ -36,6 +38,10 @@ public:
     }
 
     void create();
+    /// Create an append-optimized packed leaf when the whole batch fits in one
+    /// blob. A later large-value update converts it once to the normal
+    /// update-friendly representation.
+    void create(const BinaryData* values, size_t count);
 
     ref_type get_ref() const
     {
@@ -62,7 +68,9 @@ public:
     size_t size() const;
 
     void add(BinaryData value);
+    void append(const BinaryData* values, size_t count);
     void set(size_t ndx, BinaryData value);
+    void set_many(const size_t* positions, const BinaryData* values, size_t count, size_t position_base);
     void set_null(size_t ndx)
     {
         set(ndx, BinaryData{});
@@ -75,6 +83,7 @@ public:
     void erase(size_t ndx);
     void move(ArrayBinary& dst, size_t ndx);
     void clear();
+    bool normalize_packed();
 
     size_t find_first(BinaryData value, size_t begin, size_t end) const noexcept;
 
@@ -89,12 +98,22 @@ public:
 private:
     static constexpr size_t small_blob_max_size = 64;
 
+    enum class Kind : unsigned char {
+        Small,
+        Big,
+        Packed,
+    };
+
     Allocator& m_alloc;
     Array* m_arr;
-    alignas(ArrayBigBlobs) std::byte m_storage[std::max(sizeof(ArraySmallBlobs), sizeof(ArrayBigBlobs))];
-    bool m_is_big = false;
+    static constexpr size_t storage_size =
+        std::max(sizeof(ArrayPackedBlobs), std::max(sizeof(ArraySmallBlobs), sizeof(ArrayBigBlobs)));
+    alignas(ArrayPackedBlobs) std::byte m_storage[storage_size];
+    Kind m_kind = Kind::Small;
 
     bool upgrade_leaf(size_t value_size);
+    void replace_with_packed(const BinaryData* values, size_t count);
+    void replace_with_empty();
 };
 
 inline BinaryData ArrayBinary::get(const char* header, size_t ndx, Allocator& alloc) noexcept
@@ -102,6 +121,9 @@ inline BinaryData ArrayBinary::get(const char* header, size_t ndx, Allocator& al
     bool is_big = Array::get_context_flag_from_header(header);
     if (!is_big) {
         return ArraySmallBlobs::get(header, ndx, alloc);
+    }
+    else if (ArrayPackedBlobs::is_packed(header)) {
+        return ArrayPackedBlobs::get(header, ndx, alloc);
     }
     else {
         return ArrayBigBlobs::get(header, ndx, alloc);

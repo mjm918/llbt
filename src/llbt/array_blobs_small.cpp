@@ -14,15 +14,69 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <utility> // pair
+#include <cstring>
 
 #include <llbt/array_blobs_small.hpp>
 #include <llbt/array_blob.hpp>
 #include <llbt/impl/destroy_guard.hpp>
 
 using namespace llbt;
+
+void ArraySmallBlobs::create(const BinaryData* values, size_t count)
+{
+    size_t total_size = 0;
+    for (size_t i = 0; i < count; ++i)
+        total_size += values[i].size();
+
+    Array top(get_alloc());
+    _impl::DeepArrayDestroyGuard top_guard(&top);
+    top.create(type_HasRefs);
+    _impl::DeepArrayRefDestroyGuard child_guard(get_alloc());
+
+    Array offsets(get_alloc());
+    offsets.create(type_Normal, false, count, int64_t(total_size));
+    size_t end = 0;
+    for (size_t i = 0; i < count; ++i) {
+        end += values[i].size();
+        offsets.set(i, int64_t(end));
+    }
+    child_guard.reset(offsets.get_ref());
+    top.add(from_ref(offsets.get_ref()));
+    child_guard.release();
+
+    size_t blob_bytes = (NodeHeader::header_size + total_size + 7) & ~size_t(7);
+    MemRef blob_mem = get_alloc().alloc(std::max(blob_bytes, size_t(Node::initial_capacity)));
+    Node::init_header(blob_mem.get_addr(), false, false, false, NodeHeader::wtype_Ignore, 0,
+                      total_size, std::max(blob_bytes, size_t(Node::initial_capacity)));
+    child_guard.reset(blob_mem.get_ref());
+    char* output = Array::get_data_from_header(blob_mem.get_addr());
+    for (size_t i = 0; i < count; ++i) {
+        if (values[i].size()) {
+            std::memcpy(output, values[i].data(), values[i].size());
+            output += values[i].size();
+        }
+    }
+    std::memset(output, 0, blob_bytes - NodeHeader::header_size - total_size);
+    top.add(from_ref(blob_mem.get_ref()));
+    child_guard.release();
+
+    Array nulls(get_alloc());
+    nulls.create(type_Normal, false, count, 0);
+    for (size_t i = 0; i < count; ++i) {
+        if (values[i].is_null())
+            nulls.set(i, 1);
+    }
+    child_guard.reset(nulls.get_ref());
+    top.add(from_ref(nulls.get_ref()));
+    child_guard.release();
+
+    init_from_mem(top.get_mem());
+    top_guard.release();
+}
 
 void ArraySmallBlobs::init_from_mem(MemRef mem) noexcept
 {

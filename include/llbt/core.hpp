@@ -11,6 +11,7 @@
 ** This applies only to files authored by the llbt project. The imported
 ** storage engine underneath keeps its own copyright and the Apache License
 ** 2.0; see LICENSE and NOTICE.
+** Copyright (c) 2026 Mohammad Julfikar
 */
 #ifndef LLBT_CORE_HPP
 #define LLBT_CORE_HPP
@@ -47,6 +48,7 @@
 #include <llbt/array_timestamp.hpp>
 #include <llbt/bplustree.hpp>
 #include <llbt/core/roots_replication.hpp>
+#include <llbt/commit_metrics.hpp>
 #include <llbt/exceptions.hpp>
 #include <llbt/util/function_ref.hpp>
 
@@ -57,6 +59,17 @@
 namespace llbt::core {
 
 using NodeRef = llbt::ref_type; // a page-tree reference inside the file
+
+enum class Durability {
+    /// Strongest platform persistence primitive. On Apple this is
+    /// F_FULLFSYNC; elsewhere it is fsync/FlushFileBuffers.
+    Strict,
+    /// Ordered persistence. On Apple this uses F_BARRIERFSYNC; elsewhere it
+    /// currently has the same implementation as Strict.
+    Ordered,
+    /// No storage synchronization. Only for rebuildable data.
+    Unsafe,
+};
 
 struct Options {
     /// 64-byte AES key, or null. Requires LLBT_ENABLE_ENCRYPTION.
@@ -71,6 +84,11 @@ struct Options {
     /// faster. Opening the same file from two processes with this set is
     /// undefined behavior. In-memory stores always run in this mode.
     bool single_process = false;
+    /// Persistence guarantee. `no_sync` remains source compatible and wins
+    /// over this field when true.
+    Durability durability = Durability::Ordered;
+    /// Allow format 24 files to be upgraded to format 25 on open.
+    bool allow_file_format_upgrade = true;
 };
 
 namespace detail {
@@ -260,9 +278,26 @@ public:
     T get(size_t i) const { return m_bt->get(i); }
 
     void add(T value) { require_write(); m_bt->add(value); }
+    void add_range(const T* values, size_t count)
+    {
+        require_write();
+        if (count && !values)
+            throw std::invalid_argument("null bulk add input");
+        m_bt->add_range(values, count);
+    }
     void insert(size_t i, T value) { require_write(); m_bt->insert(i, value); }
     void set(size_t i, T value) { require_write(); m_bt->set(i, value); }
+    void set_many(const size_t* positions, const T* values, size_t count)
+    {
+        require_write();
+        m_bt->set_many(positions, values, count);
+    }
     void erase(size_t i) { require_write(); m_bt->erase(i); }
+    void erase_many(const size_t* positions, size_t count)
+    {
+        require_write();
+        m_bt->erase_many(positions, count);
+    }
     void clear() { require_write(); m_bt->clear(); }
 
     /// Index of the first element equal to `value`, or Tx::npos.
@@ -368,6 +403,11 @@ public:
     /// Rewrite the file to its minimal size (needs no live transactions).
     /// A no-op returning false for an in-memory store (nothing to rewrite).
     bool compact();
+    /// Preallocate backing-file space. This does not change the logical
+    /// database size and is a no-op for an in-memory store.
+    void reserve(size_t bytes);
+    /// Metrics for the latest physical commit made through this Store.
+    CommitMetrics last_commit_metrics() const;
     /// The backing file path, or "<llbt in-memory>" for an in-memory store.
     std::string path() const;
     /// True if this store has no backing file (opened with open_in_memory).

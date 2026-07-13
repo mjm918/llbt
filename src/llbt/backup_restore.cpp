@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <llbt/backup_restore.hpp>
@@ -34,7 +35,7 @@ using VersionList = BackupHandler::VersionList;
 using VersionTimeList = BackupHandler::VersionTimeList;
 
 // Note: accepted versions should have new versions added at front
-const VersionList BackupHandler::accepted_versions_ = {24, 23, 22, 21, 20, 11, 10};
+const VersionList BackupHandler::accepted_versions_ = {25, 24, 23, 22, 21, 20, 11, 10};
 
 // the pair is <version, age-in-seconds>
 // we keep backup files in 3 months.

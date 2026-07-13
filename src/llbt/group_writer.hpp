@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_GROUP_WRITER_HPP
@@ -29,6 +30,8 @@
 #include <llbt/array.hpp>
 #include <llbt/impl/array_writer.hpp>
 #include <llbt/db_options.hpp>
+#include <llbt/commit_metrics.hpp>
+#include <llbt/core/commit_journal.hpp>
 
 
 namespace llbt {
@@ -75,11 +78,14 @@ public:
     // Encrypted mappings flush their private dirty pages during unmap; keeping
     // them cached past rollback could write stale data after another commit.
     void clear_failed_mappings() noexcept;
+    size_t window_count() const noexcept { return m_map_windows.size(); }
+    size_t touched_window_count() const noexcept;
     class MapWindow;
     // Get a suitable memory mapping for later access:
     // potentially adding it to the cache, potentially closing
     // the least recently used and sync'ing it to disk
     MapWindow* get_window(ref_type start_ref, size_t size);
+    void write_bytes(ref_type start_ref, const void* data, size_t size);
 
 protected:
     SlabAlloc& m_alloc;
@@ -112,7 +118,7 @@ public:
     /// across commits (saves mmap/munmap churn per commit); without it a
     /// private one is created for this commit only.
     GroupCommitter(Transaction&, Durability dura = Durability::Full, util::WriteMarker* write_marker = nullptr,
-                   WriteWindowMgr* shared_window_mgr = nullptr);
+                   WriteWindowMgr* shared_window_mgr = nullptr, core::CommitMetrics* metrics = nullptr);
     ~GroupCommitter();
     /// Flush changes to physical medium, then write the new top ref
     /// to the file header, then flush again. Pass the top ref
@@ -125,6 +131,7 @@ protected:
     Durability m_durability;
     std::unique_ptr<WriteWindowMgr> m_owned_window_mgr;
     WriteWindowMgr& m_window_mgr;
+    core::CommitMetrics* m_metrics = nullptr;
 };
 
 /// This class is not supposed to be reused for multiple write sessions. In
@@ -161,6 +168,17 @@ public:
 
 
     size_t get_file_size() const noexcept;
+    size_t arrays_written() const noexcept { return m_arrays_written; }
+    size_t bytes_written() const noexcept { return m_bytes_written; }
+    size_t binary_payload_bytes() const noexcept { return m_binary_payload_bytes; }
+    size_t mapping_windows() const noexcept { return m_window_mgr.window_count(); }
+    size_t touched_mapping_windows() const noexcept { return m_window_mgr.touched_window_count(); }
+    uint64_t tree_write_us() const noexcept { return m_tree_write_us; }
+    uint64_t array_alloc_us() const noexcept { return m_array_alloc_us; }
+    uint64_t array_io_us() const noexcept { return m_array_io_us; }
+    uint64_t free_list_us() const noexcept { return m_free_list_us; }
+    const std::vector<core_detail::WrittenArray>& written_arrays() const noexcept { return m_written_arrays; }
+    WriteWindowMgr& window_manager() noexcept { return m_window_mgr; }
 
     ref_type write_array(const char*, size_t, uint32_t) override;
 
@@ -257,6 +275,14 @@ private:
     size_t m_evacuation_limit;
     int64_t m_backoff;
     size_t m_logical_size = 0;
+    size_t m_arrays_written = 0;
+    size_t m_bytes_written = 0;
+    size_t m_binary_payload_bytes = 0;
+    uint64_t m_tree_write_us = 0;
+    uint64_t m_array_alloc_us = 0;
+    uint64_t m_array_io_us = 0;
+    uint64_t m_free_list_us = 0;
+    std::vector<core_detail::WrittenArray> m_written_arrays;
 
     //  m_free_in_file;
     std::vector<FreeSpaceEntry> m_not_free_in_file;

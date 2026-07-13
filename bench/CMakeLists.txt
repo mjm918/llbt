@@ -7,6 +7,12 @@ target_link_libraries(llbt-bench-concurrency PRIVATE llbt::core)
 add_executable(llbt-bench-group-commit bench_group_commit.cpp)
 target_link_libraries(llbt-bench-group-commit PRIVATE llbt::core)
 
+find_package(SQLite3 QUIET)
+if(SQLite3_FOUND)
+    add_executable(llbt-bench-sqlite-crud bench_sqlite_crud.cpp)
+    target_link_libraries(llbt-bench-sqlite-crud PRIVATE llbt::core SQLite::SQLite3)
+endif()
+
 # Optional side-by-side comparison vs LMDB (the truest peer engine).
 # Install it first: `brew install lmdb` or `apt install liblmdb-dev`.
 execute_process(COMMAND brew --prefix lmdb OUTPUT_VARIABLE _brew_lmdb

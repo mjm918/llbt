@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_BPLUSTREE_HPP
@@ -42,6 +43,8 @@ public:
     struct State {
         int64_t split_offset;
         size_t split_size;
+        size_t insert_count = 1;
+        ref_type append_leaf_ref = 0;
     };
 
     // Insert an element at 'insert_pos'. May cause node to be split
@@ -251,7 +254,8 @@ protected:
         m_cached_leaf_end += incr;
     }
 
-    void bptree_insert(size_t n, BPlusTreeNode::InsertFunc func);
+    void bptree_insert(size_t n, BPlusTreeNode::InsertFunc func, size_t insert_count = 1,
+                       ref_type append_leaf_ref = 0);
     void bptree_erase(size_t n, BPlusTreeNode::EraseFunc func);
 
     // Create an un-attached leaf node
@@ -415,9 +419,9 @@ public:
     }
 
     // Append `count` values pulled chunk-wise from `fill(offset, n, out)`. An
-    // empty tree is assembled bottom-up — whole leaves, then the inner levels in
-    // one pass — costing orders of magnitude fewer tree descents than add() per
-    // element; a non-empty tree falls back to plain appends.
+    // empty tree is assembled bottom-up. A non-empty tree fills its tail leaf
+    // with one descent at a time and uses the normal split path only when a new
+    // leaf is needed.
     template <typename Filler>
     void add_from(size_t count, Filler&& fill)
     {
@@ -425,11 +429,47 @@ public:
             return;
         std::vector<T> buf(std::min(count, size_t(LLBT_MAX_BPNODE_SIZE)));
         if (m_size != 0) {
-            for (size_t offset = 0; offset < count;) {
-                size_t n = std::min(count - offset, size_t(LLBT_MAX_BPNODE_SIZE));
+            size_t offset = 0;
+            while (offset < count) {
+                size_t tail_size = 0;
+                m_root->bptree_access(m_size - 1, [&](BPlusTreeNode* node, size_t) {
+                    tail_size = node->get_node_size();
+                });
+                if (tail_size == LLBT_MAX_BPNODE_SIZE) {
+                    size_t n = std::min(count - offset, size_t(LLBT_MAX_BPNODE_SIZE));
+                    fill(offset, n, buf.data());
+                    LeafNode leaf(this);
+                    if constexpr (std::is_same_v<T, BinaryData>) {
+                        leaf.LeafArray::create(buf.data(), n);
+                    }
+                    else {
+                        leaf.create();
+                        for (size_t j = 0; j < n; ++j)
+                            leaf.LeafArray::add(buf[j]);
+                    }
+                    auto unreachable = [](BPlusTreeNode*, size_t) -> size_t {
+                        LLBT_UNREACHABLE();
+                    };
+                    bptree_insert(npos, unreachable, n, leaf.get_ref());
+                    m_size += n;
+                    offset += n;
+                    continue;
+                }
+                size_t n = std::min(count - offset, size_t(LLBT_MAX_BPNODE_SIZE) - tail_size);
                 fill(offset, n, buf.data());
-                for (size_t j = 0; j < n; ++j)
-                    add(buf[j]);
+                auto append = [&](BPlusTreeNode* node, size_t) {
+                    LeafNode* leaf = static_cast<LeafNode*>(node);
+                    if constexpr (std::is_same_v<T, BinaryData>) {
+                        leaf->LeafArray::append(buf.data(), n);
+                    }
+                    else {
+                        for (size_t j = 0; j < n; ++j)
+                            leaf->LeafArray::add(buf[j]);
+                    }
+                    return leaf->size();
+                };
+                bptree_insert(npos, append, n);
+                m_size += n;
                 offset += n;
             }
             return;
@@ -440,9 +480,14 @@ public:
             size_t n = std::min(count - offset, size_t(LLBT_MAX_BPNODE_SIZE));
             fill(offset, n, buf.data());
             LeafNode leaf(this);
-            leaf.create();
-            for (size_t j = 0; j < n; ++j)
-                leaf.LeafArray::add(buf[j]);
+            if constexpr (std::is_same_v<T, BinaryData>) {
+                leaf.LeafArray::create(buf.data(), n);
+            }
+            else {
+                leaf.create();
+                for (size_t j = 0; j < n; ++j)
+                    leaf.LeafArray::add(buf[j]);
+            }
             leaves.push_back(leaf.get_ref());
             offset += n;
         }
@@ -516,6 +561,56 @@ public:
         };
 
         m_root->bptree_access(n, func);
+    }
+
+    void set_many(const size_t* positions, const T* values, size_t count)
+    {
+        if (count == 0)
+            return;
+        if (!positions || !values)
+            throw std::invalid_argument("null bulk set input");
+        for (size_t i = 0; i < count; ++i) {
+            if (positions[i] >= m_size)
+                throw std::out_of_range("bulk set position");
+            if (i && positions[i - 1] >= positions[i])
+                throw std::invalid_argument("bulk set positions must be sorted and unique");
+        }
+
+        size_t next = 0;
+        m_root->bptree_traverse([&](BPlusTreeNode* node, size_t offset) {
+            LeafNode* leaf = static_cast<LeafNode*>(node);
+            size_t end = offset + leaf->size();
+            if constexpr (std::is_same_v<T, BinaryData>) {
+                size_t first = next;
+                while (next < count && positions[next] < end)
+                    ++next;
+                leaf->LeafArray::set_many(positions + first, values + first, next - first, offset);
+            }
+            else {
+                while (next < count && positions[next] < end) {
+                    leaf->set(positions[next] - offset, values[next]);
+                    ++next;
+                }
+            }
+            return next == count ? IteratorControl::Stop : IteratorControl::AdvanceToNext;
+        });
+        invalidate_leaf_cache();
+    }
+
+    void erase_many(const size_t* positions, size_t count)
+    {
+        if (count == 0)
+            return;
+        if (!positions)
+            throw std::invalid_argument("null bulk erase input");
+        for (size_t i = 0; i < count; ++i) {
+            if (positions[i] >= m_size)
+                throw std::out_of_range("bulk erase position");
+            if (i && positions[i - 1] >= positions[i])
+                throw std::invalid_argument("bulk erase positions must be sorted and unique");
+        }
+        for (size_t i = count; i > 0; --i)
+            erase(positions[i - 1]);
     }
 
     void swap(size_t ndx1, size_t ndx2) override
@@ -714,6 +809,24 @@ public:
     {
         while (m_root->get_node_size() > LLBT_MAX_BPNODE_SIZE) {
             split_root();
+        }
+    }
+
+    bool normalize_packed_blobs()
+    {
+        if constexpr (!std::is_same_v<T, BinaryData>) {
+            return false;
+        }
+        else {
+            bool changed = false;
+            m_root->bptree_traverse([&](BPlusTreeNode* node, size_t) {
+                LeafNode* leaf = static_cast<LeafNode*>(node);
+                changed = leaf->LeafArray::normalize_packed() || changed;
+                return IteratorControl::AdvanceToNext;
+            });
+            if (changed)
+                invalidate_leaf_cache();
+            return changed;
         }
     }
 

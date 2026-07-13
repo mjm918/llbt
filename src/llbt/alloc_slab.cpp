@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <algorithm>
@@ -662,6 +663,18 @@ int SlabAlloc::get_committed_file_format_version() noexcept
     int slot_selector = ((header.m_flags & SlabAlloc::flags_SelectBit) != 0 ? 1 : 0);
     int file_format_version = int(header.m_file_format[slot_selector]);
     return file_format_version;
+}
+
+ref_type SlabAlloc::get_committed_top_ref() noexcept
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mapping_mutex);
+        if (m_mappings.size())
+            util::encryption_read_barrier(m_mappings[0].primary_mapping, 0, sizeof(Header));
+    }
+    const Header& header = *reinterpret_cast<const Header*>(m_data);
+    int slot_selector = ((header.m_flags & SlabAlloc::flags_SelectBit) != 0 ? 1 : 0);
+    return ref_type(header.m_top_ref[slot_selector]);
 }
 
 bool SlabAlloc::is_file_on_streaming_form(const Header& header)
@@ -1522,7 +1535,6 @@ void SlabAlloc::resize_file(size_t new_file_size)
     }
 }
 
-#ifdef LLBT_DEBUG
 void SlabAlloc::reserve_disk_space(size_t size)
 {
     if (size != round_up_to_page_size(size))
@@ -1533,7 +1545,6 @@ void SlabAlloc::reserve_disk_space(size_t size)
     if (!disable_sync)
         m_file.sync(); // Throws
 }
-#endif
 
 void SlabAlloc::verify() const
 {

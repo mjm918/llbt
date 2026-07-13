@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_GROUP_SHARED_OPTIONS_HPP
@@ -31,7 +32,8 @@ struct DBOptions {
     enum class Durability : uint16_t {
         Full,
         MemOnly,
-        Unsafe // No crash-consistency or durability guarantee
+        Unsafe, // No crash-consistency or durability guarantee
+        Strict  // Strongest platform persistence primitive
     };
 
     explicit DBOptions(Durability level = Durability::Full, const char* key = nullptr)

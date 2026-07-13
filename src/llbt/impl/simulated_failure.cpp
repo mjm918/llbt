@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <algorithm>
@@ -221,6 +222,14 @@ std::string ErrorCategory::message(int value) const
             return "Simulated failure (generic)";
         case SimulatedFailure::group_writer__commit:
             return "Simulated failure (group_writer__commit)";
+        case SimulatedFailure::commit_journal__partial_record:
+            return "Simulated failure (commit_journal__partial_record)";
+        case SimulatedFailure::commit_journal__before_sync:
+            return "Simulated failure (commit_journal__before_sync)";
+        case SimulatedFailure::commit_journal__after_sync:
+            return "Simulated failure (commit_journal__after_sync)";
+        case SimulatedFailure::commit_journal__checkpoint:
+            return "Simulated failure (commit_journal__checkpoint)";
         case SimulatedFailure::slab_alloc__reset_free_space_tracking:
             return "Simulated failure (slab_alloc__reset_free_space_tracking)";
         case SimulatedFailure::slab_alloc__remap:

@@ -14,15 +14,50 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <algorithm>
+#include <cstring>
 
 #include <llbt/array_blobs_big.hpp>
 #include <llbt/column_integer.hpp>
+#include <llbt/impl/destroy_guard.hpp>
 
 
 using namespace llbt;
+
+void ArrayBigBlobs::create(const BinaryData* values, size_t count)
+{
+    Array::create(type_HasRefs, true, count, 0);
+    _impl::DeepArrayRefDestroyGuard child_guard(m_alloc);
+    for (size_t i = 0; i < count; ++i) {
+        if (values[i].is_null())
+            continue;
+        if (values[i].size() > ArrayBlob::max_binary_size) {
+            ArrayBlob blob(m_alloc);
+            blob.create();
+            _impl::DeepArrayDestroyGuard blob_guard(&blob);
+            ref_type ref = blob.add(values[i].data(), values[i].size());
+            Array::set_as_ref(i, ref);
+            blob_guard.release();
+            continue;
+        }
+        size_t bytes = (NodeHeader::header_size + values[i].size() + 7) & ~size_t(7);
+        size_t capacity = std::max(bytes, size_t(Node::initial_capacity));
+        MemRef mem = m_alloc.alloc(capacity);
+        child_guard.reset(mem.get_ref());
+        Node::init_header(mem.get_addr(), false, false, false, NodeHeader::wtype_Ignore, 0,
+                          values[i].size(), capacity);
+        char* output = Array::get_data_from_header(mem.get_addr());
+        if (values[i].size())
+            std::memcpy(output, values[i].data(), values[i].size());
+        std::memset(output + values[i].size(), 0,
+                    bytes - NodeHeader::header_size - values[i].size());
+        Array::set_as_ref(i, mem.get_ref());
+        child_guard.release();
+    }
+}
 
 BinaryData ArrayBigBlobs::get_at(size_t ndx, size_t& pos) const noexcept
 {
@@ -60,18 +95,48 @@ void ArrayBigBlobs::set(size_t ndx, BinaryData value, bool add_zero_term)
 
     ref_type ref = get_as_ref(ndx);
 
+    auto make_blob = [&]() {
+        size_t value_size = value.size() + size_t(add_zero_term);
+        if (value_size > ArrayBlob::max_binary_size) {
+            ArrayBlob blob(m_alloc);
+            blob.create();
+            _impl::DeepArrayDestroyGuard guard(&blob);
+            ref_type new_ref = blob.add(value.data(), value.size(), add_zero_term);
+            Array::set_as_ref(ndx, new_ref);
+            guard.release();
+            return new_ref;
+        }
+        size_t bytes = (NodeHeader::header_size + value_size + 7) & ~size_t(7);
+        size_t capacity = std::max(bytes, size_t(Node::initial_capacity));
+        MemRef mem = m_alloc.alloc(capacity);
+        _impl::DeepArrayRefDestroyGuard guard(mem.get_ref(), m_alloc);
+        Node::init_header(mem.get_addr(), false, false, false, NodeHeader::wtype_Ignore, 0,
+                          value_size, capacity);
+        char* output = Array::get_data_from_header(mem.get_addr());
+        if (value.size())
+            std::memcpy(output, value.data(), value.size());
+        if (add_zero_term)
+            output[value.size()] = 0;
+        std::memset(output + value_size, 0, bytes - NodeHeader::header_size - value_size);
+        Array::set_as_ref(ndx, mem.get_ref());
+        guard.release();
+        return mem.get_ref();
+    };
+
     if (ref == 0 && value.is_null()) {
         return;
     }
     else if (ref == 0 && value.data() != nullptr) {
-        ArrayBlob new_blob(m_alloc);
-        new_blob.create();                                             // Throws
-        ref = new_blob.add(value.data(), value.size(), add_zero_term); // Throws
-        Array::set_as_ref(ndx, ref);
+        make_blob();
         return;
     }
     else if (ref != 0 && value.data() != nullptr) {
         char* header = m_alloc.translate(ref);
+        if (!Array::get_context_flag_from_header(header) && m_alloc.is_read_only(ref)) {
+            make_blob();
+            Array::destroy(ref, m_alloc);
+            return;
+        }
         if (Array::get_context_flag_from_header(header)) {
             Array arr(m_alloc);
             arr.init_from_mem(MemRef(header, ref, m_alloc));

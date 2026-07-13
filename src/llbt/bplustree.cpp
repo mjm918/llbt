@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <llbt/bplustree.hpp>
@@ -183,11 +184,21 @@ ref_type BPlusTreeLeaf::bptree_insert(size_t ndx, State& state, InsertFunc func)
     LLBT_ASSERT_DEBUG(leaf_size <= LLBT_MAX_BPNODE_SIZE);
     if (ndx > leaf_size)
         ndx = leaf_size;
+    if (state.append_leaf_ref) {
+        LLBT_ASSERT_RELEASE(ndx == leaf_size);
+        state.split_offset = leaf_size;
+        state.split_size = leaf_size + state.insert_count;
+        return state.append_leaf_ref;
+    }
     if (LLBT_LIKELY(leaf_size < LLBT_MAX_BPNODE_SIZE)) {
-        func(this, ndx);
-        m_tree->adjust_leaf_bounds(1);
+        size_t new_size = func(this, ndx);
+        LLBT_ASSERT_RELEASE(new_size == leaf_size + state.insert_count);
+        LLBT_ASSERT_RELEASE(new_size <= LLBT_MAX_BPNODE_SIZE);
+        m_tree->adjust_leaf_bounds(int(state.insert_count));
         return 0; // Leaf was not split
     }
+
+    LLBT_ASSERT_RELEASE(state.insert_count == 1);
 
     // Split leaf node
     auto new_leaf = m_tree->create_leaf_node();
@@ -361,9 +372,9 @@ ref_type BPlusTreeInner::bptree_insert(size_t ndx, State& state, InsertFunc func
     }
 
     if (!new_sibling_ref) {
-        adjust(size() - 1, +2); // Throws
+        adjust(size() - 1, int64_t(state.insert_count * 2)); // Throws
         if (m_offsets.is_attached()) {
-            m_offsets.adjust(child_ndx, m_offsets.size(), 1);
+            m_offsets.adjust(child_ndx, m_offsets.size(), int64_t(state.insert_count));
         }
         return 0;
     }
@@ -613,11 +624,11 @@ ref_type BPlusTreeInner::insert_bp_node(size_t child_ndx, ref_type new_sibling_r
     size_t sz = get_node_size();
     if (sz < LLBT_MAX_BPNODE_SIZE) {
         // Room in current node for the new child
-        adjust(size() - 1, +2); // Throws
+        adjust(size() - 1, int64_t(state.insert_count * 2)); // Throws
         if (m_offsets.is_attached()) {
             size_t elem_ndx_offset = get_bp_node_offset(child_ndx);
             m_offsets.insert(child_ndx, elem_ndx_offset + state.split_offset); // Throws
-            m_offsets.adjust(child_ndx + 1, m_offsets.size(), +1);             // Throws
+            m_offsets.adjust(child_ndx + 1, m_offsets.size(), int64_t(state.insert_count)); // Throws
         }
         insert_bp_node_ref(new_ref_ndx, new_sibling_ref);
         return ref_type(0);
@@ -803,13 +814,16 @@ void BPlusTreeBase::bulk_adopt_leaves(std::vector<ref_type>& level, size_t total
     invalidate_leaf_cache();
 }
 
-void BPlusTreeBase::bptree_insert(size_t n, BPlusTreeNode::InsertFunc func)
+void BPlusTreeBase::bptree_insert(size_t n, BPlusTreeNode::InsertFunc func, size_t insert_count,
+                                 ref_type append_leaf_ref)
 {
     size_t bptree_size = m_root->get_tree_size();
     if (n == bptree_size) {
         n = npos;
     }
-    BPlusTreeNode::State state;
+    BPlusTreeNode::State state{};
+    state.insert_count = insert_count;
+    state.append_leaf_ref = append_leaf_ref;
     ref_type new_sibling_ref = m_root->bptree_insert(n, state, func);
     if (LLBT_UNLIKELY(new_sibling_ref)) {
         bool compact_form = (n == npos) && m_root->is_compact();

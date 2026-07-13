@@ -19,6 +19,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 #ifndef LLBT_CORE_ROOTS_REPLICATION_HPP
 #define LLBT_CORE_ROOTS_REPLICATION_HPP
@@ -32,13 +33,17 @@ namespace core_detail {
 /// Schema version stored in the file's history slots for llbt::core files.
 /// Distinct from Barq's in-barq history schema so that opening a Barq file
 /// with llbt (or vice versa) fails cleanly instead of misreading data.
-constexpr int g_llbt_roots_schema_version = 1001;
+// Schema 1003 marks format-25 files which may contain packed binary leaves.
+// Builds which only know schema 1002 reject these files before reading a
+// packed descriptor as the old big-blob layout.
+constexpr int g_llbt_roots_schema_version = 1003;
 
 /// Registry layout, anchored at the top array's history-ref slot:
 ///   registry[0] = ref  -> BPlusTree<StringData>  (root names)
 ///   registry[1] = ref  -> Array(hasRefs)         (root refs, parallel)
 ///   registry[2] = ref  -> Array(tagged ints)     (type tags, parallel)
-constexpr int g_llbt_registry_size = 3;
+///   registry[3] = ref  -> commit journal descriptor
+constexpr int g_llbt_registry_size = 4;
 
 std::unique_ptr<Replication> make_roots_replication();
 

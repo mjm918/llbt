@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_GROUP_HPP
@@ -501,7 +502,7 @@ private:
     /// upgrade logic in Group::upgrade_file_format(), AND the lists of accepted
     /// file formats and the version deletion list residing in "backup_restore.cpp"
 
-    static constexpr int g_current_file_format_version = 24;
+    static constexpr int g_current_file_format_version = 25;
 
     int get_file_format_version() const noexcept;
     void set_file_format_version(int) noexcept;
@@ -701,6 +702,14 @@ public:
     static ref_type get_history_ref(const Group& group) noexcept
     {
         return Group::get_history_ref(group.m_top);
+    }
+
+    static size_t get_logical_file_size(Allocator& alloc, ref_type top_ref) noexcept
+    {
+        Array top(alloc);
+        if (top_ref)
+            top.init_from_ref(top_ref);
+        return Group::get_logical_file_size(top);
     }
 
     static int get_file_format_version(const Group& group) noexcept

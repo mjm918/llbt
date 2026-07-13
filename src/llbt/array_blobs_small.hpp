@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_ARRAY_BLOBS_SMALL_HPP
@@ -67,6 +68,7 @@ public:
     /// Note that the caller assumes ownership of the allocated
     /// underlying node. It is not owned by the accessor.
     void create();
+    void create(const BinaryData* values, size_t count);
 
     //@{
     /// Overriding functions of Array

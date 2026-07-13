@@ -14,9 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <algorithm>
+#include <chrono>
 #include <set>
 
 #include <iostream>
@@ -28,6 +30,7 @@
 #include <llbt/disable_sync_to_disk.hpp>
 #include <llbt/impl/destroy_guard.hpp>
 #include <llbt/impl/simulated_failure.hpp>
+#include <llbt/core/crc32c.hpp>
 #include <llbt/util/safe_int_ops.hpp>
 
 using namespace llbt;
@@ -50,6 +53,8 @@ public:
         LLBT_ASSERT_RELEASE(dest_addr && (reinterpret_cast<size_t>(dest_addr) & 7) == 0);
         memcpy(dest_addr, &checksum, 4);
         memcpy(dest_addr + 4, data + 4, size - 4);
+        ++m_owner.m_arrays_written;
+        m_owner.m_bytes_written += size;
         // return ref of the written array
         ref_type ref = to_ref(pos);
         return ref;
@@ -150,7 +155,8 @@ size_t WriteWindowMgr::known_file_size(size_t required_size)
 
 bool WriteWindowMgr::needs_sync_on_unmap() const
 {
-    return m_durability == Durability::Full && !get_disable_sync_to_disk();
+    return (m_durability == Durability::Full || m_durability == Durability::Strict) &&
+           !get_disable_sync_to_disk();
 }
 
 // The file may grow in increments much smaller than 1MB. This can lead to a stream of requests
@@ -265,13 +271,14 @@ WriteWindowMgr::WriteWindowMgr(SlabAlloc& alloc, Durability dura, WriteMarker* w
 WriteWindowMgr::~WriteWindowMgr() = default;
 
 GroupCommitter::GroupCommitter(Transaction& group, Durability dura, WriteMarker* write_marker,
-                               WriteWindowMgr* shared_window_mgr)
+                               WriteWindowMgr* shared_window_mgr, core::CommitMetrics* metrics)
     : m_group(group)
     , m_alloc(group.m_alloc)
     , m_durability(dura)
     , m_owned_window_mgr(shared_window_mgr ? nullptr
                                            : std::make_unique<WriteWindowMgr>(group.m_alloc, dura, write_marker))
     , m_window_mgr(shared_window_mgr ? *shared_window_mgr : *m_owned_window_mgr)
+    , m_metrics(metrics)
 {
 }
 
@@ -350,6 +357,7 @@ void GroupWriter::sync_according_to_durability()
 {
     switch (m_durability) {
         case Durability::Full:
+        case Durability::Strict:
             m_window_mgr.sync_all_mappings();
             break;
         case Durability::Unsafe:
@@ -391,6 +399,13 @@ void WriteWindowMgr::sync_all_mappings()
     }
 }
 
+size_t WriteWindowMgr::touched_window_count() const noexcept
+{
+    return size_t(std::count_if(m_map_windows.begin(), m_map_windows.end(), [](const auto& window) {
+        return window->m_touched;
+    }));
+}
+
 // Get a window matching a request, either creating a new window or reusing an
 // existing one (possibly extended to accomodate the new request). Maintain a
 // cache of open windows which are sync'ed and closed following a least recently
@@ -420,6 +435,15 @@ WriteWindowMgr::MapWindow* WriteWindowMgr::get_window(ref_type start_ref, size_t
     auto new_window = std::make_unique<MapWindow>(*this, m_alloc.get_file(), start_ref, size, m_write_marker);
     m_map_windows.insert(m_map_windows.begin(), std::move(new_window));
     return m_map_windows[0].get();
+}
+
+void WriteWindowMgr::write_bytes(ref_type start_ref, const void* input, size_t size)
+{
+    MapWindow* window = get_window(start_ref, size);
+    char* destination = window->translate(start_ref);
+    window->encryption_read_barrier(destination, size);
+    std::memcpy(destination, input, size);
+    window->encryption_write_barrier(destination, size);
 }
 
 #define LLBT_ALLOC_DEBUG 0
@@ -703,7 +727,11 @@ ref_type GroupWriter::write_group()
     ALLOC_DBG_COUT("Commit nr " << m_current_version << "   ( from " << m_oldest_reachable_version << " )"
                                 << std::endl);
 
+    auto free_list_begin = std::chrono::steady_clock::now();
     read_in_freelist();
+    m_free_list_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - free_list_begin)
+                                  .count());
     // Now, 'm_size_map' holds all free elements candidate for recycling
 
     Array& top = m_group.m_top;
@@ -722,6 +750,7 @@ ref_type GroupWriter::write_group()
         in_memory_writer = std::make_unique<InMemoryWriter>(*this);
         writer = in_memory_writer.get();
     }
+    auto tree_write_begin = std::chrono::steady_clock::now();
     ref_type names_ref = m_group.m_table_names.write(*writer, deep, only_if_modified); // Throws
     ref_type tables_ref = m_group.m_tables.write(*writer, deep, only_if_modified);     // Throws
 
@@ -767,6 +796,11 @@ ref_type GroupWriter::write_group()
             top.set(Group::s_evacuation_point_ndx, 0);
         }
     }
+
+    m_tree_write_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - tree_write_begin)
+                                   .count());
+    free_list_begin = std::chrono::steady_clock::now();
 
     ALLOC_DBG_COUT("  Freelist size after allocations: " << m_size_map.size() << std::endl);
     // We now back-date (if possible) any blocks freed in versions which
@@ -999,6 +1033,9 @@ ref_type GroupWriter::write_group()
         write_array_at(window, top_ref, top.get_header(), top_byte_size); // Throws
         window->encryption_write_barrier(start_addr, used);
     }
+    m_free_list_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - free_list_begin)
+                                  .count());
     // Return top_ref so that it can be saved in lock file used for coordination
     return top_ref;
 }
@@ -1323,16 +1360,24 @@ GroupWriter::FreeListElement GroupWriter::extend_free_space(size_t requested_siz
     // extended the file size. It can also happen as part of initial file expansion
     // during attach_file().
     size_t logical_file_size = to_size_t(m_group.m_top.get(2) / 2);
-    // find minimal new size according to the following growth ratios:
-    // at least 100% (doubling) until we reach 1MB, then just grow with 1MB at a time
+    // Find the minimum new size. Once files are larger than 1 MiB, grow by
+    // enough for the current transaction instead of extending the file once
+    // per large array. The extra 12.5% covers tree nodes and the final free
+    // lists without leaving large permanent holes.
     uint64_t minimal_new_size = logical_file_size;
     constexpr uint64_t growth_boundary = 1024 * 1024; // 1MB
     if (minimal_new_size < growth_boundary) {
         minimal_new_size *= 2;
     }
     else {
-        minimal_new_size += growth_boundary;
+        uint64_t commit_size = m_alloc.get_commit_size();
+        uint64_t growth = std::max<uint64_t>(growth_boundary, commit_size + commit_size / 8);
+        minimal_new_size += growth;
     }
+    // Store::reserve() may already have made the physical file much larger
+    // than the logical file. Claim that space in one step so later commits do
+    // not repeatedly resize mappings for storage that is already allocated.
+    minimal_new_size = std::max<uint64_t>(minimal_new_size, get_file_size());
     // grow with at least the growth ratio, but if more is required, grow more
     uint64_t required_new_size = logical_file_size + requested_size;
     if (required_new_size > minimal_new_size) {
@@ -1396,9 +1441,15 @@ bool inline is_aligned(char* addr)
 ref_type GroupWriter::write_array(const char* data, size_t size, uint32_t checksum)
 {
     // Get position of free space to write in (expanding file if needed)
+    auto alloc_begin = std::chrono::steady_clock::now();
     size_t pos = get_free_space(size);
+    m_array_alloc_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - alloc_begin)
+                                    .count());
 
     // Write the block
+    auto io_begin = std::chrono::steady_clock::now();
+#if LLBT_ENABLE_ENCRYPTION
     MapWindow* window = m_window_mgr.get_window(pos, size);
     char* dest_addr = window->translate(pos);
     LLBT_ASSERT_RELEASE(is_aligned(dest_addr));
@@ -1406,6 +1457,24 @@ ref_type GroupWriter::write_array(const char* data, size_t size, uint32_t checks
     memcpy(dest_addr, &checksum, 4);
     memcpy(dest_addr + 4, data + 4, size - 4);
     window->encryption_write_barrier(dest_addr, size);
+#else
+    // pwrite avoids faulting every new file-backed mmap page on the hot path.
+    // The commit's final barrier/fsync covers these writes together with the
+    // journal record. Recovery still validates this checksum before using the
+    // array, so a partial positional write cannot become a committed array.
+    util::File& file = m_alloc.get_file();
+    file.write(pos, reinterpret_cast<const char*>(&checksum), sizeof(checksum));
+    file.write(pos + sizeof(checksum), data + sizeof(checksum), size - sizeof(checksum));
+#endif
+    m_array_io_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - io_begin)
+                                 .count());
+    ++m_arrays_written;
+    m_bytes_written += size;
+    if (!Array::get_hasrefs_from_header(data) &&
+        Array::get_wtype_from_header(data) == Array::wtype_Ignore)
+        m_binary_payload_bytes += size - NodeHeader::header_size;
+    m_written_arrays.push_back({to_ref(pos), uint32_t(size), checksum});
     // return ref of the written array
     ref_type ref = to_ref(pos);
     return ref;
@@ -1421,14 +1490,21 @@ void GroupWriter::write_array_at(T* translator, ref_type ref, const char* data, 
     char* dest_addr = translator->translate(pos);
     LLBT_ASSERT_RELEASE(is_aligned(dest_addr));
 
-    uint32_t dummy_checksum = 0x41414141UL; // "AAAA" in ASCII
-    memcpy(dest_addr, &dummy_checksum, 4);
+    uint32_t checksum = core_detail::Crc32c::compute(data + 4, size - 4);
+    memcpy(dest_addr, &checksum, 4);
     memcpy(dest_addr + 4, data + 4, size - 4);
+    ++m_arrays_written;
+    m_bytes_written += size;
+    if (!Array::get_hasrefs_from_header(data) &&
+        Array::get_wtype_from_header(data) == Array::wtype_Ignore)
+        m_binary_payload_bytes += size - NodeHeader::header_size;
+    m_written_arrays.push_back({ref, uint32_t(size), checksum});
 }
 
 
 void GroupCommitter::commit(ref_type new_top_ref)
 {
+    auto publish_begin = std::chrono::steady_clock::now();
     using _impl::SimulatedFailure;
     SimulatedFailure::trigger(SimulatedFailure::group_writer__commit); // Throws
 
@@ -1461,13 +1537,28 @@ void GroupCommitter::commit(ref_type new_top_ref)
     // Make sure that that all data relating to the new snapshot is written to
     // stable storage before flipping the slot selector
     window->encryption_write_barrier(&file_header, sizeof file_header);
+    auto flush_begin = std::chrono::steady_clock::now();
     m_window_mgr.flush_all_mappings();
+    if (m_metrics)
+        m_metrics->flush_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - flush_begin)
+                                           .count());
     if (!disable_sync) {
+        auto sync_begin = std::chrono::steady_clock::now();
         m_window_mgr.sync_all_mappings();
-        m_alloc.get_file().barrier();
+        if (m_durability == Durability::Strict)
+            m_alloc.get_file().sync();
+        else
+            m_alloc.get_file().barrier();
+        if (m_metrics)
+            m_metrics->first_sync_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - sync_begin)
+                                                   .count());
     }
 
     // Flip the slot selector bit.
+    _impl::SimulatedFailure::trigger(_impl::SimulatedFailure::commit_journal__checkpoint);
+    auto header_begin = std::chrono::steady_clock::now();
     window->encryption_read_barrier(&file_header, sizeof file_header);
     using type_2 = std::remove_reference<decltype(file_header.m_flags)>::type;
     file_header.m_flags = type_2(new_flags);
@@ -1475,9 +1566,27 @@ void GroupCommitter::commit(ref_type new_top_ref)
     // Write new selector to disk
     window->encryption_write_barrier(&file_header.m_flags, sizeof(file_header.m_flags));
     window->flush();
+    if (m_metrics)
+        m_metrics->header_update_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - header_begin)
+                                                  .count());
     if (!disable_sync) {
+        auto sync_begin = std::chrono::steady_clock::now();
         window->sync();
-        m_alloc.get_file().barrier();
+        if (m_durability == Durability::Strict)
+            m_alloc.get_file().sync();
+        else
+            m_alloc.get_file().barrier();
+        if (m_metrics)
+            m_metrics->second_sync_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now() - sync_begin)
+                                                    .count());
+    }
+
+    if (m_metrics) {
+        m_metrics->header_publish_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - publish_begin)
+                                                   .count());
     }
 }
 

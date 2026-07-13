@@ -11,6 +11,7 @@
 ** This applies only to files authored by the llbt project. The imported
 ** storage engine underneath keeps its own copyright and the Apache License
 ** 2.0; see LICENSE and NOTICE.
+** Copyright (c) 2026 Mohammad Julfikar
 */
 
 #include "testsettings.hpp"
@@ -273,6 +274,44 @@ TEST(CApi_FilePersistence)
         llbt_txn_abort(r);
         llbt_store_close(store);
     }
+}
+
+TEST(CApi_ExtendedOpenReserveAndBulk)
+{
+    TEST_PATH(path);
+    llbt_open_options options{};
+    options.struct_size = sizeof(options);
+    options.durability = LLBT_DURABILITY_STRICT;
+    options.single_process = 1;
+    options.allow_file_format_upgrade = 1;
+    llbt_store* store = nullptr;
+    std::string p(path);
+    CHECK_EQUAL(llbt_store_open_ex(p.c_str(), &options, &store), LLBT_OK);
+    CHECK_EQUAL(llbt_store_reserve(store, 1024 * 1024), LLBT_OK);
+
+    llbt_txn* w = nullptr;
+    CHECK_EQUAL(llbt_txn_begin_write(store, &w), LLBT_OK);
+    llbt_tree* tree = nullptr;
+    CHECK_EQUAL(llbt_tree_open(w, "bulk", LLBT_TYPE_INT64, &tree), LLBT_OK);
+    llbt_value values[6];
+    for (size_t i = 0; i < 6; ++i)
+        values[i] = llbt_int64(int64_t(i));
+    CHECK_EQUAL(llbt_tree_add_range(tree, values, 6), LLBT_OK);
+    const size_t set_positions[] = {1, 4};
+    const llbt_value replacements[] = {llbt_int64(10), llbt_int64(40)};
+    CHECK_EQUAL(llbt_tree_set_many(tree, set_positions, replacements, 2), LLBT_OK);
+    const size_t erase_positions[] = {0, 3};
+    CHECK_EQUAL(llbt_tree_erase_many(tree, erase_positions, 2), LLBT_OK);
+    CHECK_EQUAL(llbt_tree_size(tree), size_t(4));
+    llbt_value out;
+    CHECK_EQUAL(llbt_tree_get(tree, 0, &out), LLBT_OK);
+    CHECK_EQUAL(out.as.i64, int64_t(10));
+    llbt_tree_destroy(tree);
+    CHECK_EQUAL(llbt_txn_commit(w, nullptr), LLBT_OK);
+    llbt_store_close(store);
+
+    options.struct_size = sizeof(options) - 1;
+    CHECK_EQUAL(llbt_store_open_ex(p.c_str(), &options, &store), LLBT_E_INVALID_ARG);
 }
 
 namespace {

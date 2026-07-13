@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <llbt/array_with_find.hpp>
@@ -25,6 +26,7 @@
 #include <llbt/query_conditions.hpp>
 #include <llbt/array_integer.hpp>
 #include <llbt/impl/array_writer.hpp>
+#include <llbt/core/crc32c.hpp>
 
 #include <array>
 #include <cstring> // std::memcpy
@@ -84,8 +86,8 @@
 //
 // 'size' (aka length) is the number of elements in the array.
 //
-// 'checksum' (not yet implemented) is the checksum of the array
-// including the header.
+// 'checksum' is CRC32C of bytes [4, byte_size), including structural
+// header fields and payload but excluding the checksum field itself.
 //
 //
 // Inner node of B+-tree:
@@ -273,8 +275,8 @@ ref_type Array::do_write_shallow(_impl::ArrayWriterBase& out) const
     // Write flat array
     const char* header = get_header_from_data(m_data);
     size_t byte_size = get_byte_size();
-    uint32_t dummy_checksum = 0x41414141UL;                                // "AAAA" in ASCII
-    ref_type new_ref = out.write_array(header, byte_size, dummy_checksum); // Throws
+    uint32_t checksum = core_detail::Crc32c::compute(header + 4, byte_size - 4);
+    ref_type new_ref = out.write_array(header, byte_size, checksum); // Throws
     LLBT_ASSERT_3(new_ref % 8, ==, 0);                                    // 8-byte alignment
     return new_ref;
 }

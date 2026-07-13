@@ -17,6 +17,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <llbt/core/roots_replication.hpp>
@@ -63,7 +64,8 @@ public:
 
     bool is_upgradable_history_schema(int stored_schema_version) const noexcept override
     {
-        return stored_schema_version == core_detail::g_llbt_roots_schema_version;
+        return stored_schema_version == 1001 || stored_schema_version == 1002 ||
+               stored_schema_version == core_detail::g_llbt_roots_schema_version;
     }
 
     void upgrade_history_schema(int) override {}

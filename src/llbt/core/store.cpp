@@ -11,11 +11,13 @@
 ** This applies only to files authored by the llbt project. The imported
 ** storage engine underneath keeps its own copyright and the Apache License
 ** 2.0; see LICENSE and NOTICE.
+** Copyright (c) 2026 Mohammad Julfikar
 */
 #include <llbt/core.hpp>
 
 #include <llbt/group.hpp>
 #include <llbt/db_options.hpp>
+#include <llbt/core/commit_journal.hpp>
 
 #include <condition_variable>
 #include <deque>
@@ -196,10 +198,23 @@ StoreRef Store::open(const std::string& path, const Options& options)
 
     DBOptions db_options;
     db_options.encryption_key = options.encryption_key;
-    if (options.no_sync)
+    if (options.no_sync || options.durability == Durability::Unsafe)
         db_options.durability = DBOptions::Durability::Unsafe;
+    else if (options.durability == Durability::Strict)
+        db_options.durability = DBOptions::Durability::Strict;
+    else
+        db_options.durability = DBOptions::Durability::Full;
     db_options.single_process = options.single_process;
+    db_options.allow_file_format_upgrade = options.allow_file_format_upgrade;
     store->m_db = DB::create(*store->m_repl, path, db_options);
+    if (store->m_db->current_file_format_version() >= 25 && !store->m_db->has_commit_journal()) {
+        Tx setup = store->begin_write();
+        if (core_detail::CommitJournal::ensure(setup.m_reg->top))
+            setup.commit();
+        else
+            setup.rollback();
+        store->m_db->refresh_commit_journal();
+    }
     return store;
 }
 
@@ -313,6 +328,7 @@ void Store::lead_batch(GroupCommitter& gc)
     // Run the whole batch in the shared transaction, then commit once.
     std::exception_ptr batch_error;
     size_t thrower = n; // index of a throwing closure; n = none
+    bool physical_commit_failed = false;
     {
         ClosureGuard guard(this);
         for (size_t i = 0; i < n; ++i) {
@@ -337,6 +353,7 @@ void Store::lead_batch(GroupCommitter& gc)
         }
         catch (...) {
             batch_error = std::current_exception();
+            physical_commit_failed = true;
         }
     }
 
@@ -344,6 +361,16 @@ void Store::lead_batch(GroupCommitter& gc)
     // batch is rolled back (Tx dtor), and each entry gets an individual
     // outcome. A throwing closure is NOT re-run — its fate is decided.
     tx.reset();
+
+    // A disk, journal, or sync failure has one physical outcome for the whole
+    // group. Retrying closures as separate commits could duplicate a commit
+    // whose sync completed but whose publication failed.
+    if (physical_commit_failed) {
+        finish([&](Pending& p) {
+            p.error = batch_error;
+        });
+        return;
+    }
 
     if (n == 1) {
         finish([&](Pending& p) {
@@ -380,7 +407,37 @@ bool Store::compact()
 {
     if (m_in_memory)
         return false; // nothing to rewrite: no backing file
+    // Packed binary leaves keep immutable base and delta blocks so updates and
+    // deletes stay cheap. Fold those deltas into fresh base blocks before the
+    // physical copy, otherwise compact() would preserve stale payload bytes.
+    {
+        Tx tx = begin_write();
+        bool changed = false;
+        const size_t roots = tx.m_reg->count();
+        for (size_t i = 0; i < roots; ++i) {
+            if (tx.m_reg->type(i) != detail::type_tag<BinaryData>::value)
+                continue;
+            std::string name(tx.m_reg->name(i));
+            auto tree = tx.tree<BinaryData>(name);
+            changed = tree.raw().normalize_packed_blobs() || changed;
+        }
+        if (changed)
+            tx.commit();
+        else
+            tx.rollback();
+    }
     return m_db->compact();
+}
+
+void Store::reserve(size_t bytes)
+{
+    if (!m_in_memory)
+        m_db->reserve(bytes);
+}
+
+CommitMetrics Store::last_commit_metrics() const
+{
+    return m_db->get_last_commit_metrics();
 }
 
 std::string Store::path() const

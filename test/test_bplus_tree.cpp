@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include "testsettings.hpp"
@@ -129,7 +130,7 @@ TEST(BPlusTree_AddRange)
         tree.destroy();
     }
 
-    // Bulk append into a non-empty tree takes the per-element fallback.
+    // Bulk append into a non-empty tree fills leaves in chunks.
     {
         BPlusTree<Int> tree(Allocator::get_default());
         tree.create();
@@ -161,6 +162,67 @@ TEST(BPlusTree_AddRange)
         tree.verify();
         tree.destroy();
     }
+}
+
+TEST(BPlusTree_SetAndEraseMany)
+{
+    BPlusTree<Int> tree(Allocator::get_default());
+    tree.create();
+    std::vector<Int> values(5000);
+    for (size_t i = 0; i < values.size(); ++i)
+        values[i] = Int(i);
+    tree.add_range(values.data(), values.size());
+
+    const size_t positions[] = {0, 999, 1000, 2500, 4999};
+    const Int replacements[] = {-1, -2, -3, -4, -5};
+    tree.set_many(positions, replacements, 5);
+    for (size_t i = 0; i < 5; ++i)
+        CHECK_EQUAL(tree.get(positions[i]), replacements[i]);
+    tree.verify();
+
+    tree.erase_many(positions, 5);
+    CHECK_EQUAL(tree.size(), 4995);
+    CHECK_EQUAL(tree.get(0), 1);
+    CHECK_EQUAL(tree.get(997), 998);
+    CHECK_EQUAL(tree.get(998), 1001);
+    CHECK_EQUAL(tree.get(999), 1002);
+    tree.verify();
+
+    const size_t bad[] = {4, 4};
+    CHECK_THROW(tree.erase_many(bad, 2), std::invalid_argument);
+    CHECK_EQUAL(tree.size(), 4995);
+    tree.destroy();
+}
+
+TEST(BPlusTree_BinaryAddRangeIntoNonEmptyTree)
+{
+    BPlusTree<BinaryData> tree(Allocator::get_default());
+    tree.create();
+    std::vector<std::string> first_storage(1300);
+    std::vector<BinaryData> first;
+    first.reserve(first_storage.size());
+    for (size_t i = 0; i < first_storage.size(); ++i) {
+        first_storage[i] = std::to_string(i) + std::string(1024, 'a');
+        first.emplace_back(first_storage[i]);
+    }
+    tree.add_range(first.data(), first.size());
+
+    std::vector<std::string> second_storage(2500);
+    std::vector<BinaryData> second;
+    second.reserve(second_storage.size());
+    for (size_t i = 0; i < second_storage.size(); ++i) {
+        second_storage[i] = std::to_string(i + first.size()) + std::string(1024, 'b');
+        second.emplace_back(second_storage[i]);
+    }
+    tree.add_range(second.data(), second.size());
+
+    CHECK_EQUAL(tree.size(), size_t(3800));
+    CHECK_EQUAL(tree.get(0), first[0]);
+    CHECK_EQUAL(tree.get(1299), first[1299]);
+    CHECK_EQUAL(tree.get(1300), second[0]);
+    CHECK_EQUAL(tree.get(3799), second[2499]);
+    tree.verify();
+    tree.destroy();
 }
 
 TEST(BPlusTree_Timestamp)

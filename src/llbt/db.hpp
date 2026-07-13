@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #ifndef LLBT_DB_HPP
@@ -21,6 +22,7 @@
 
 #include <llbt/db_options.hpp>
 #include <llbt/group.hpp>
+#include <llbt/commit_metrics.hpp>
 #include <llbt/impl/transact_log.hpp>
 #include <llbt/replication.hpp>
 #include <llbt/util/checked_mutex.hpp>
@@ -40,6 +42,9 @@ namespace llbt {
 
 class Transaction;
 class WriteWindowMgr;
+namespace core_detail {
+class CommitJournal;
+}
 using TransactionRef = std::shared_ptr<Transaction>;
 
 /// Thrown by DB::create() if the lock file is already open in another
@@ -195,9 +200,6 @@ public:
         return m_db_path;
     }
 
-#ifdef LLBT_DEBUG
-    /// Deprecated method, only called from a unit test
-    ///
     /// Reserve disk space now to avoid allocation errors at a later
     /// point in time, and to minimize on-disk fragmentation. In some
     /// cases, less fragmentation translates into improved
@@ -215,7 +217,10 @@ public:
     /// It is an error to call this function on an unattached shared
     /// group. Doing so will result in undefined behavior.
     void reserve(size_t size_in_bytes);
-#endif
+    core::CommitMetrics get_last_commit_metrics() const;
+    int current_file_format_version() const noexcept { return m_file_format_version; }
+    bool has_commit_journal() const noexcept { return bool(m_commit_journal); }
+    void refresh_commit_journal();
 
     /// Querying for changes:
     ///
@@ -506,6 +511,9 @@ private:
     // Write-window cache reused across commits (created on first commit).
     // Must be dropped before the data file is detached or replaced.
     std::unique_ptr<WriteWindowMgr> m_write_window_mgr;
+    mutable std::mutex m_commit_metrics_mutex;
+    core::CommitMetrics m_last_commit_metrics;
+    std::unique_ptr<core_detail::CommitJournal> m_commit_journal;
     std::unique_ptr<VersionManager> m_version_manager;
     std::unique_ptr<EncryptionMarkerObserver> m_marker_observer;
     Replication* m_replication = nullptr;

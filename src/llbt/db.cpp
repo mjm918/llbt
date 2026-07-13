@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Copyright (c) 2026 Mohammad Julfikar
  **************************************************************************/
 
 #include <llbt/transaction.hpp>
@@ -34,6 +35,7 @@
 
 #include <llbt/disable_sync_to_disk.hpp>
 #include <llbt/group_writer.hpp>
+#include <llbt/core/commit_journal.hpp>
 #include <llbt/impl/simulated_failure.hpp>
 #include <llbt/replication.hpp>
 #include <llbt/util/errno.hpp>
@@ -1227,6 +1229,12 @@ void DB::open(const std::string& path, const DBOptions& options)
                 throw UnsupportedFileFormatVersion(current_file_format_version);
             }
 
+            if (current_file_format_version == 25 && top_ref) {
+                core_detail::CommitJournal::Recovery recovered;
+                m_commit_journal = core_detail::CommitJournal::open(alloc, top_ref, &recovered);
+                if (begin_new_session && m_commit_journal && recovered.top_ref)
+                    top_ref = recovered.top_ref;
+            }
             if (begin_new_session) {
                 // Determine version (snapshot number) and check history
                 // compatibility
@@ -1418,6 +1426,8 @@ void DB::open(const std::string& path, const DBOptions& options)
             switch (options.durability) {
                 case DBOptions::Durability::Full:
                     return "Full";
+                case DBOptions::Durability::Strict:
+                    return "Strict";
                 case DBOptions::Durability::MemOnly:
                     return "MemOnly";
                 case llbt::DBOptions::Durability::Unsafe:
@@ -1741,6 +1751,19 @@ bool DB::compact(bool bump_version_number, std::optional<const char*> output_enc
             logical_file_size = Group::get_logical_file_size(top);
         }
         m_version_manager->init_versioning(top_ref, logical_file_size, info->latest_version_number);
+        if (m_file_format_version >= 25 && top_ref) {
+            m_write_window_mgr = std::make_unique<WriteWindowMgr>(m_alloc, dura, m_marker_observer.get());
+            m_commit_journal = core_detail::CommitJournal::open_at_checkpoint(m_alloc, top_ref);
+            if (m_commit_journal) {
+                m_commit_journal->clear_after_compaction(*m_write_window_mgr, top_ref,
+                                                         info->latest_version_number, logical_file_size);
+                m_write_window_mgr->flush_all_mappings();
+                if (dura == Durability::Strict)
+                    m_alloc.get_file().sync();
+                else if (dura == Durability::Full)
+                    m_alloc.get_file().barrier();
+            }
+        }
         if (m_logger) {
             auto t2 = std::chrono::steady_clock::now();
             m_logger->log(util::Logger::Level::info, "DB compacted from: %1 to %2 in %3 us", file_size_before,
@@ -2504,6 +2527,9 @@ DB::version_type DB::get_version_of_latest_snapshot()
 
 void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, bool commit_to_disk)
 {
+    core::CommitMetrics commit_metrics;
+    auto commit_begin = std::chrono::steady_clock::now();
+    commit_metrics.file_size_before = uint64_t(m_alloc.get_file_size());
     SharedInfo* info = m_info;
 
     // Version of oldest snapshot currently (or recently) bound in a transaction
@@ -2514,6 +2540,15 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
     {
         CheckedLockGuard lock(m_mutex);
         m_version_manager->cleanup_versions(oldest_live_version, top_refs, any_new_unreachables);
+        // The on-disk header still points at the journal checkpoint. Keep that
+        // version in GroupWriter's reachability set until a newer header has
+        // been made durable. Otherwise normal COW reuse can overwrite pages
+        // needed to find and validate the journal after a restart.
+        if (m_commit_journal && m_commit_journal->checkpoint_top_ref()) {
+            top_refs.emplace(m_commit_journal->checkpoint_version(),
+                             VersionInfo{m_commit_journal->checkpoint_top_ref(),
+                                         m_commit_journal->checkpoint_logical_size()});
+        }
         oldest_version = top_refs.begin()->first;
         // Allow for trimming of the history. Some types of histories do not
         // need store changesets prior to the oldest *live* bound snapshot.
@@ -2565,7 +2600,20 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
     {
         // protect against race with any other DB trying to attach to the file
         std::lock_guard<InterprocessMutex> lock(m_controlmutex); // Throws
+        auto write_begin = std::chrono::steady_clock::now();
         new_top_ref = out.write_group();                         // Throws
+        commit_metrics.write_group_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                     std::chrono::steady_clock::now() - write_begin)
+                                                     .count());
+        commit_metrics.arrays_written = out.arrays_written();
+        commit_metrics.cow_bytes_written = out.bytes_written();
+        commit_metrics.binary_payload_bytes = out.binary_payload_bytes();
+        commit_metrics.mapping_windows = out.mapping_windows();
+        commit_metrics.mapping_windows_touched = out.touched_mapping_windows();
+        commit_metrics.tree_write_us = out.tree_write_us();
+        commit_metrics.array_alloc_us = out.array_alloc_us();
+        commit_metrics.array_io_us = out.array_io_us();
+        commit_metrics.free_list_us = out.free_list_us();
     }
     {
         // protect access to shared variables and m_reader_mapping from here
@@ -2574,12 +2622,60 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
         m_locked_space = out.get_locked_space_size();
         m_used_space = out.get_logical_size() - m_free_space;
         m_evac_stage.store(EvacStage(out.get_evacuation_stage()));
-        out.sync_according_to_durability();
-        if (Durability(info->durability) == Durability::Full || Durability(info->durability) == Durability::Unsafe) {
+        Durability durability = Durability(info->durability);
+        bool journal_commit = m_commit_journal && commit_to_disk && durability != Durability::MemOnly;
+        bool journal_checkpoint = journal_commit &&
+                                  m_commit_journal->needs_checkpoint(core_detail::CommitJournal::required_size(
+                                      out.written_arrays().size()), out.bytes_written());
+        std::optional<core_detail::CommitJournal::PendingAppend> journal_append;
+        if (journal_commit && !journal_checkpoint) {
+            journal_append = m_commit_journal->prepare_append(out.window_manager(), new_version, new_top_ref,
+                                                               out.get_logical_size(), out.written_arrays());
+        }
+
+        if (journal_append) {
+            _impl::SimulatedFailure::trigger(_impl::SimulatedFailure::group_writer__commit);
+            _impl::SimulatedFailure::trigger(_impl::SimulatedFailure::commit_journal__before_sync);
+            // From this point a failing storage call can leave a transaction
+            // durably present even if this process did not publish it. Force a
+            // session restart on failure so the journal decides the outcome.
+            info->commit_in_critical_phase = 1;
+            // The journal record and all COW pages are now visible in the
+            // shared file image. Flush encrypted mappings, then issue exactly
+            // one device barrier for the whole commit.
+            auto flush_begin = std::chrono::steady_clock::now();
+            out.window_manager().flush_all_mappings();
+            commit_metrics.flush_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - flush_begin)
+                                                  .count());
+            commit_metrics.data_sync_us = commit_metrics.flush_us;
+            auto publish_begin = std::chrono::steady_clock::now();
+            if (durability == Durability::Strict)
+                m_alloc.get_file().sync();
+            else if (durability == Durability::Full)
+                m_alloc.get_file().barrier();
+            commit_metrics.header_publish_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                            std::chrono::steady_clock::now() - publish_begin)
+                                                            .count());
+            if (durability != Durability::Unsafe)
+                commit_metrics.first_sync_us = commit_metrics.header_publish_us;
+            _impl::SimulatedFailure::trigger(_impl::SimulatedFailure::commit_journal__after_sync);
+            m_commit_journal->commit_append(*journal_append);
+        }
+        else if (durability == Durability::Full || durability == Durability::Strict ||
+                 durability == Durability::Unsafe) {
             if (commit_to_disk) {
-                GroupCommitter cm(transaction, Durability(info->durability), m_marker_observer.get(),
-                                  m_write_window_mgr.get());
+                auto sync_begin = std::chrono::steady_clock::now();
+                out.sync_according_to_durability();
+                commit_metrics.data_sync_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                           std::chrono::steady_clock::now() - sync_begin)
+                                                           .count());
+                GroupCommitter cm(transaction, durability, m_marker_observer.get(), m_write_window_mgr.get(),
+                                  &commit_metrics);
                 cm.commit(new_top_ref);
+                if (journal_checkpoint)
+                    m_commit_journal->reset_after_checkpoint(out.window_manager(), new_top_ref, new_version,
+                                                             out.get_logical_size());
             }
         }
         size_t new_file_size = out.get_logical_size();
@@ -2627,15 +2723,38 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
                       commit_size, std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
                       to_disk_str);
     }
+    commit_metrics.file_size_after = uint64_t(m_alloc.get_file_size());
+    commit_metrics.physical_file_growth = int64_t(commit_metrics.file_size_after) -
+                                          int64_t(commit_metrics.file_size_before);
+    commit_metrics.total_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - commit_begin)
+                                           .count());
+    {
+        std::lock_guard lock(m_commit_metrics_mutex);
+        m_last_commit_metrics = commit_metrics;
+    }
 }
 
-#ifdef LLBT_DEBUG
+core::CommitMetrics DB::get_last_commit_metrics() const
+{
+    std::lock_guard lock(m_commit_metrics_mutex);
+    return m_last_commit_metrics;
+}
+
+void DB::refresh_commit_journal()
+{
+    // Refresh the allocator mapping to the latest logical size before reading
+    // journal chunks. The checkpoint top itself still comes from the header.
+    TransactionRef mapping_guard = start_read();
+    ref_type checkpoint_top = m_alloc.get_committed_top_ref();
+    m_commit_journal = core_detail::CommitJournal::open(m_alloc, checkpoint_top);
+}
+
 void DB::reserve(size_t size)
 {
     LLBT_ASSERT(is_attached());
     m_alloc.reserve_disk_space(size); // Throws
 }
-#endif
 
 bool DB::call_with_lock(const std::string& llbt_path, CallbackWithLock&& callback)
 {
