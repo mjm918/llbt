@@ -226,7 +226,9 @@ TEST_IF(CoreStore_JournalFaultRecovery, _impl::SimulatedFailure::is_enabled())
 TEST(CoreStore_PublicBulkOperations)
 {
     TEST_PATH(path);
-    StoreRef store = Store::open(path, {.single_process = true});
+    Options options;
+    options.single_process = true;
+    StoreRef store = Store::open(path, options);
     Tx tx = store->begin_write();
     Tree<int64_t> tree = tx.tree<int64_t>("bulk");
     std::vector<int64_t> first(1001);
